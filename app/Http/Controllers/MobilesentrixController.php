@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\MSCategory;
 use App\Models\MSProduct;
+use App\Models\MSSyncLog;
 use Illuminate\Http\Client\Pool;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -16,6 +17,9 @@ class MobilesentrixController extends Controller
     private const CATEGORY_STATUS_WORKING = 1;
     private const CATEGORY_STATUS_COMPLETED = 2;
     private const PRODUCT_SYNC_WORKERS = 5;
+    private const SYNC_LOG_STATUS_CATEGORY = 0;
+    private const SYNC_LOG_STATUS_PRODUCT = 1;
+    private const SYNC_LOG_STATUS_COMPLETED = 2;
 
     public function MsCategory(): JsonResponse
     {
@@ -23,6 +27,13 @@ class MobilesentrixController extends Controller
             $nodeResponse = Http::timeout(600)->get('http://localhost:3000/getCategory');
 
             if ($nodeResponse->failed()) {
+                MSSyncLog::create([
+                    'category_name' => 'MobileSentrix Categories',
+                    'message' => $nodeResponse->body(),
+                    'status' => self::SYNC_LOG_STATUS_CATEGORY,
+                    'link' => 'http://localhost:3000/getCategory',
+                ]);
+
                 return response()->json([
                     'success' => false,
                     'message' => 'MobileSentrix node scraper request failed.',
@@ -35,6 +46,13 @@ class MobilesentrixController extends Controller
             $groups = data_get($payload, 'data', []);
 
             if (! is_array($groups)) {
+                MSSyncLog::create([
+                    'category_name' => 'MobileSentrix Categories',
+                    'message' => 'Invalid node scraper response.',
+                    'status' => self::SYNC_LOG_STATUS_CATEGORY,
+                    'link' => 'http://localhost:3000/getCategory',
+                ]);
+
                 return response()->json([
                     'success' => false,
                     'message' => 'Invalid node scraper response.',
@@ -83,6 +101,19 @@ class MobilesentrixController extends Controller
                     ['url'],
                     ['maincatagory', 'name', 'updated_at']
                 );
+
+                foreach ($rows as $row) {
+                    MSSyncLog::updateOrCreate(
+                        [
+                            'status' => self::SYNC_LOG_STATUS_COMPLETED,
+                            'link' => $row['url'],
+                        ],
+                        [
+                            'category_name' => $row['name'],
+                            'message' => 'MobileSentrix category synced successfully.',
+                        ]
+                    );
+                }
             }
 
             return response()->json([
@@ -92,6 +123,13 @@ class MobilesentrixController extends Controller
                 'category_count' => count($rows),
             ]);
         } catch (Throwable $exception) {
+            MSSyncLog::create([
+                'category_name' => 'MobileSentrix Categories',
+                'message' => $exception->getMessage(),
+                'status' => self::SYNC_LOG_STATUS_CATEGORY,
+                'link' => 'http://localhost:3000/getCategory',
+            ]);
+
             return response()->json([
                 'success' => false,
                 'message' => $exception->getMessage(),
@@ -146,6 +184,13 @@ class MobilesentrixController extends Controller
                     ]);
 
                     if ($nodeResponse->failed()) {
+                        MSSyncLog::create([
+                            'category_name' => $category->name,
+                            'message' => $nodeResponse->body(),
+                            'status' => self::SYNC_LOG_STATUS_PRODUCT,
+                            'link' => $category->url,
+                        ]);
+
                         $stats['failed_categories'][] = [
                             'category_id' => $category->id,
                             'url' => $category->url,
@@ -162,6 +207,13 @@ class MobilesentrixController extends Controller
                     $products = data_get($payload, 'data', []);
 
                     if (! is_array($products)) {
+                        MSSyncLog::create([
+                            'category_name' => $category->name,
+                            'message' => 'Invalid node scraper product response.',
+                            'status' => self::SYNC_LOG_STATUS_PRODUCT,
+                            'link' => $category->url,
+                        ]);
+
                         $stats['failed_categories'][] = [
                             'category_id' => $category->id,
                             'url' => $category->url,
@@ -192,6 +244,13 @@ class MobilesentrixController extends Controller
                         $description = $description === '' ? null : $description;
 
                         if ($productUrl === null && $sku === null) {
+                            MSSyncLog::create([
+                                'category_name' => $category->name,
+                                'message' => 'Product skipped because product URL and SKU are missing.',
+                                'status' => self::SYNC_LOG_STATUS_PRODUCT,
+                                'link' => $category->url,
+                            ]);
+
                             $stats['products_skipped']++;
 
                             continue;
@@ -237,7 +296,25 @@ class MobilesentrixController extends Controller
                         'is_status' => self::CATEGORY_STATUS_COMPLETED,
                         'product_count' => $savedCount,
                     ]);
+
+                    MSSyncLog::updateOrCreate(
+                        [
+                            'status' => self::SYNC_LOG_STATUS_COMPLETED,
+                            'link' => $category->url,
+                        ],
+                        [
+                            'category_name' => $category->name,
+                            'message' => 'MobileSentrix products synced successfully.',
+                        ]
+                    );
                 } catch (Throwable $exception) {
+                    MSSyncLog::create([
+                        'category_name' => $category->name,
+                        'message' => $exception->getMessage(),
+                        'status' => self::SYNC_LOG_STATUS_PRODUCT,
+                        'link' => $category->url,
+                    ]);
+
                     $stats['failed_categories'][] = [
                         'category_id' => $category->id,
                         'url' => $category->url,
@@ -259,6 +336,13 @@ class MobilesentrixController extends Controller
                 ...$stats,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
+            MSSyncLog::create([
+                'category_name' => 'MobileSentrix Products',
+                'message' => $exception->getMessage(),
+                'status' => self::SYNC_LOG_STATUS_PRODUCT,
+                'link' => 'http://localhost:3000/getProduct',
+            ]);
+
             return response()->json([
                 'success' => false,
                 'message' => $exception->getMessage(),
@@ -304,6 +388,13 @@ class MobilesentrixController extends Controller
                 'workers' => $workers,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
+            MSSyncLog::create([
+                'category_name' => 'MobileSentrix Products',
+                'message' => $exception->getMessage(),
+                'status' => self::SYNC_LOG_STATUS_PRODUCT,
+                'link' => $syncUrl,
+            ]);
+
             return response()->json([
                 'success' => false,
                 'message' => $exception->getMessage(),
