@@ -8,11 +8,12 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::create('mobilesentrix_categories', function (Blueprint $table) {
+        Schema::create('ms_categories', function (Blueprint $table) {
             $table->id();
+            $table->string('maincatagory')->nullable();
             $table->string('name');
             $table->string('url')->unique();
-            $table->boolean('is_sync')->default(0);
+            $table->unsignedTinyInteger('is_sync')->default(0);
             $table->unsignedInteger('product_count')->default(0);
             $table->timestamps();
         });
@@ -20,6 +21,6 @@ return new class extends Migration
 
     public function down(): void
     {
-        Schema::dropIfExists('mobilesentrix_categories');
+        Schema::dropIfExists('ms_categories');
     }
 };
