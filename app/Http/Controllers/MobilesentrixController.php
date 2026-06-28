@@ -192,14 +192,14 @@ class MobilesentrixController extends Controller
     public function MsCategory(): JsonResponse
     {
         try {
-            $nodeResponse = Http::timeout(600)->get('http://localhost:3000/getCategory');
+            $nodeResponse = Http::timeout(600)->get('https://node-scraper.asa2020.com/mobilesentrix/getCategory');
 
             if ($nodeResponse->failed()) {
                 MSSyncLog::create([
                     'category_name' => 'MobileSentrix Categories',
                     'message' => $nodeResponse->body(),
                     'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => 'http://localhost:3000/getCategory',
+                    'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getCategory',
                 ]);
 
                 return response()->json([
@@ -218,7 +218,7 @@ class MobilesentrixController extends Controller
                     'category_name' => 'MobileSentrix Categories',
                     'message' => 'Invalid node scraper response.',
                     'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => 'http://localhost:3000/getCategory',
+                    'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getCategory',
                 ]);
 
                 return response()->json([
@@ -295,7 +295,7 @@ class MobilesentrixController extends Controller
                 'category_name' => 'MobileSentrix Categories',
                 'message' => $exception->getMessage(),
                 'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                'link' => 'http://localhost:3000/getCategory',
+                'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getCategory',
             ]);
 
             return response()->json([
@@ -371,7 +371,7 @@ class MobilesentrixController extends Controller
                 ]);
 
                 try {
-                    $nodeResponse = Http::timeout(1200)->get('http://localhost:3000/getProduct', [
+                    $nodeResponse = Http::timeout(1200)->get('https://node-scraper.asa2020.com/mobilesentrix/getProduct', [
                         'url' => $category->url,
                     ]);
 
@@ -563,7 +563,7 @@ class MobilesentrixController extends Controller
                 'category_name' => 'MobileSentrix Products',
                 'message' => $exception->getMessage(),
                 'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                'link' => 'http://localhost:3000/getProduct',
+                'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getProduct',
             ]);
 
             if ($scrapingLog !== null) {
