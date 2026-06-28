@@ -7,12 +7,14 @@ use App\Models\MSDescriptionCompare;
 use App\Models\MSOldProduct;
 use App\Models\MSPriceCompare;
 use App\Models\MSProduct;
+use App\Models\MSScrapingLog;
 use App\Models\MSSyncLog;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 use Throwable;
 
 class MobilesentrixController extends Controller
@@ -30,6 +32,162 @@ class MobilesentrixController extends Controller
     private const SYNC_LOG_STATUS_PRODUCT = 1;
 
     private const SYNC_LOG_STATUS_COMPLETED = 2;
+
+    private const SCRAPING_LOG_STATUS_PROCESSING = 0;
+
+    private const SCRAPING_LOG_STATUS_COMPLETED = 1;
+
+    private const SCRAPING_LOG_STATUS_ISSUE = 2;
+
+    private const DASHBOARD_SYNC_INTERVAL_DAYS = 7;
+
+    public function Dashboard(Request $request)
+    {
+        $activeTable = $request->query('table', 'products');
+
+        if (! in_array($activeTable, ['products', 'price', 'description'], true)) {
+            $activeTable = 'products';
+        }
+
+        $perPage = (int) $request->query('per_page', 10);
+
+        if (! in_array($perPage, [10, 25, 50], true)) {
+            $perPage = 10;
+        }
+
+        $hasProductsTable = Schema::hasTable('ms_product');
+        $hasCategoriesTable = Schema::hasTable('ms_categories');
+        $hasPriceCompareTable = Schema::hasTable('ms_price_compare');
+        $hasDescriptionCompareTable = Schema::hasTable('ms_description_compare');
+        $hasScrapingLogTable = Schema::hasTable('ms_scraping_log');
+        $statusColumn = $hasCategoriesTable && Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
+        $totalProducts = $hasProductsTable ? MSProduct::query()->count() : 0;
+        $priceChanges = $hasPriceCompareTable ? MSPriceCompare::query()->count() : 0;
+        $descriptionUpdates = $hasDescriptionCompareTable ? MSDescriptionCompare::query()->count() : 0;
+        $totalCategories = $hasCategoriesTable ? MSCategory::query()->count() : 0;
+        $completedCategories = $hasCategoriesTable
+            ? MSCategory::query()
+                ->where($statusColumn, self::CATEGORY_STATUS_COMPLETED)
+                ->count()
+            : 0;
+        $latestLog = $hasScrapingLogTable
+            ? MSScrapingLog::query()
+                ->latest('start_time')
+                ->first()
+            : null;
+        $latestProcessingLog = $hasScrapingLogTable
+            ? MSScrapingLog::query()
+                ->where('status', self::SCRAPING_LOG_STATUS_PROCESSING)
+                ->latest('start_time')
+                ->first()
+            : null;
+        $trendRows = $hasScrapingLogTable
+            ? MSScrapingLog::query()
+                ->whereNotNull('start_time')
+                ->orderByDesc('start_time')
+                ->limit(8)
+                ->get()
+                ->reverse()
+                ->values()
+            : collect();
+        $dashboardTable = $this->getDashboardTable($activeTable, $perPage);
+
+        if ($trendRows->isEmpty()) {
+            $trendRows = collect([
+                (object) [
+                    'start_time' => now(),
+                    'product_count' => $totalProducts,
+                ],
+            ]);
+        }
+
+        $lastRunText = $latestLog?->end_time
+            ? $this->formatDuration($latestLog->end_time->diffInMinutes(now()))
+            : 'No runs yet';
+        $nextRunText = 'Ready';
+
+        if ($latestLog?->start_time) {
+            $nextRunAt = $latestLog->start_time->copy()->addDays(self::DASHBOARD_SYNC_INTERVAL_DAYS);
+            $nextRunText = $nextRunAt->isFuture()
+                ? 'In ~'.$this->formatDuration(now()->diffInMinutes($nextRunAt))
+                : 'Ready';
+        }
+
+        return view('ms-dashboard', [
+            'metrics' => [
+                'total_products' => $totalProducts,
+                'price_changes' => $priceChanges,
+                'description_updates' => $descriptionUpdates,
+            ],
+            'status' => [
+                'total_categories' => $totalCategories,
+                'completed_categories' => $completedCategories,
+                'scraping_status' => $latestProcessingLog ? 'Processing' : 'Idle',
+                'last_run' => $lastRunText,
+                'next_run' => $nextRunText,
+            ],
+            'trendRows' => $trendRows,
+            'activeTable' => $activeTable,
+            'perPage' => $perPage,
+            'dashboardTable' => $dashboardTable,
+        ]);
+    }
+
+    public function ExportAllProducts(): StreamedResponse
+    {
+        $fileName = 'ms-products-'.now()->format('Y-m-d-His').'.csv';
+
+        return response()->streamDownload(function (): void {
+            $handle = fopen('php://output', 'w');
+
+            fputcsv($handle, [
+                'ID',
+                'Category',
+                'Name',
+                'SKU',
+                'Price',
+                'Image',
+                'Product URL',
+                'Description',
+                'Created At',
+                'Updated At',
+            ]);
+
+            if (! Schema::hasTable('ms_product')) {
+                fclose($handle);
+
+                return;
+            }
+
+            $productsQuery = MSProduct::query()->orderBy('id');
+
+            if (Schema::hasTable('ms_categories')) {
+                $productsQuery->with('category:id,name');
+            }
+
+            $productsQuery
+                ->chunk(500, function ($products) use ($handle): void {
+                    foreach ($products as $product) {
+                        fputcsv($handle, [
+                            $product->id,
+                            $product->relationLoaded('category') ? $product->category?->name : null,
+                            $product->name,
+                            $product->sku,
+                            $product->price,
+                            $product->img,
+                            $product->product_url,
+                            $product->description,
+                            $product->created_at,
+                            $product->updated_at,
+                        ]);
+                    }
+                });
+
+            fclose($handle);
+        }, $fileName, [
+            'Content-Type' => 'text/csv',
+        ]);
+    }
 
     public function MsCategory(): JsonResponse
     {
@@ -149,6 +307,8 @@ class MobilesentrixController extends Controller
 
     public function MsProductSync(): JsonResponse
     {
+        $scrapingLog = null;
+        $startedAt = now();
         $stats = [
             'categories_processed' => 0,
             'products_fetched' => 0,
@@ -162,6 +322,21 @@ class MobilesentrixController extends Controller
 
         try {
             $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
+            $categoryCount = MSCategory::query()
+                ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+                ->whereNotNull('url')
+                ->where('url', '<>', '')
+                ->count();
+
+            $scrapingLog = MSScrapingLog::create([
+                'start_time' => $startedAt,
+                'product_count' => 0,
+                'category_count' => $categoryCount,
+                'processing' => 0,
+                'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
+                'created_at' => $startedAt,
+                'updated_at' => $startedAt,
+            ]);
 
             while (true) {
                 while (true) {
@@ -191,6 +366,9 @@ class MobilesentrixController extends Controller
                 }
 
                 $stats['categories_processed']++;
+                $scrapingLog->update([
+                    'processing' => $stats['categories_processed'],
+                ]);
 
                 try {
                     $nodeResponse = Http::timeout(1200)->get('http://localhost:3000/getProduct', [
@@ -311,6 +489,10 @@ class MobilesentrixController extends Controller
                     }
 
                     $stats['products_fetched'] += count($products);
+                    $scrapingLog->update([
+                        'product_count' => $stats['products_fetched'],
+                        'processing' => $stats['categories_processed'],
+                    ]);
 
                     $categoryUpdate = [
                         $statusColumn => self::CATEGORY_STATUS_COMPLETED,
@@ -357,6 +539,17 @@ class MobilesentrixController extends Controller
             }
 
             $successful = $stats['failed_categories'] === [];
+            $finishedAt = now();
+
+            $scrapingLog->update([
+                'end_time' => $finishedAt,
+                'product_count' => $stats['products_fetched'],
+                'processing' => $stats['categories_processed'],
+                'status' => $successful
+                    ? self::SCRAPING_LOG_STATUS_COMPLETED
+                    : self::SCRAPING_LOG_STATUS_ISSUE,
+                'updated_at' => $finishedAt,
+            ]);
 
             return response()->json([
                 'success' => $successful,
@@ -373,6 +566,18 @@ class MobilesentrixController extends Controller
                 'link' => 'http://localhost:3000/getProduct',
             ]);
 
+            if ($scrapingLog !== null) {
+                $finishedAt = now();
+
+                $scrapingLog->update([
+                    'end_time' => $finishedAt,
+                    'product_count' => $stats['products_fetched'],
+                    'processing' => $stats['categories_processed'],
+                    'status' => self::SCRAPING_LOG_STATUS_ISSUE,
+                    'updated_at' => $finishedAt,
+                ]);
+            }
+
             return response()->json([
                 'success' => false,
                 'message' => $exception->getMessage(),
@@ -380,6 +585,7 @@ class MobilesentrixController extends Controller
             ], 500);
         }
     }
+
     public function MsProduct(Request $request): JsonResponse
     {
         $syncUrl = $request->getSchemeAndHttpHost().route('ms-product-sync', [], false);
@@ -450,6 +656,124 @@ class MobilesentrixController extends Controller
                 'message' => $exception->getMessage(),
             ], 500);
         }
+    }
+
+    private function getDashboardTable(string $activeTable, int $perPage): array
+    {
+        return match ($activeTable) {
+            'price' => [
+                'title' => 'Price Changes',
+                'columns' => ['Product', 'SKU', 'Type', 'Old Value', 'New Value'],
+                'rows' => $this->getPriceChangeRows(),
+                'paginator' => null,
+                'empty' => 'No price changes found.',
+            ],
+            'description' => [
+                'title' => 'Description Updates',
+                'columns' => ['Product', 'SKU', 'Type', 'Old Value', 'New Value'],
+                'rows' => $this->getDescriptionChangeRows(),
+                'paginator' => null,
+                'empty' => 'No description updates found.',
+            ],
+            default => [
+                'title' => 'All Products',
+                'columns' => ['Product', 'SKU', 'Category', 'Price', 'Updated', 'URL'],
+                ...$this->getProductRows($perPage),
+                'empty' => 'No products found.',
+            ],
+        };
+    }
+
+    private function getProductRows(int $perPage): array
+    {
+        if (! Schema::hasTable('ms_product')) {
+            return [
+                'rows' => collect(),
+                'paginator' => null,
+            ];
+        }
+
+        $productsQuery = MSProduct::query()->latest();
+
+        if (Schema::hasTable('ms_categories')) {
+            $productsQuery->with('category:id,name');
+        }
+
+        $products = $productsQuery
+            ->paginate($perPage)
+            ->withQueryString();
+
+        return [
+            'rows' => $products
+                ->getCollection()
+                ->map(fn (MSProduct $product): array => [
+                    'Product' => $product->name ?: 'Unknown product',
+                    'SKU' => $product->sku ?: '-',
+                    'Category' => $product->relationLoaded('category') ? ($product->category?->name ?: '-') : '-',
+                    'Price' => $product->price ?: '-',
+                    'Updated' => $product->updated_at?->format('M d, Y h:i A') ?: '-',
+                    'URL' => $product->product_url ?: null,
+                ]),
+            'paginator' => $products,
+        ];
+    }
+
+    private function getPriceChangeRows()
+    {
+        if (! Schema::hasTable('ms_price_compare')) {
+            return collect();
+        }
+
+        return MSPriceCompare::query()
+            ->latest()
+            ->limit(50)
+            ->get()
+            ->map(fn (MSPriceCompare $change): array => [
+                'Product' => $change->product_name ?: 'Unknown product',
+                'SKU' => $change->sku ?: '-',
+                'Type' => 'Price',
+                'Old Value' => $change->old_price ?: '-',
+                'New Value' => $change->new_price ?: '-',
+            ]);
+    }
+
+    private function getDescriptionChangeRows()
+    {
+        if (! Schema::hasTable('ms_description_compare')) {
+            return collect();
+        }
+
+        return MSDescriptionCompare::query()
+            ->latest()
+            ->limit(50)
+            ->get()
+            ->map(fn (MSDescriptionCompare $change): array => [
+                'Product' => $change->product_name ?: 'Unknown product',
+                'SKU' => $change->sku ?: '-',
+                'Type' => 'Description',
+                'Old Value' => str($change->old_description ?: '-')->limit(120),
+                'New Value' => str($change->new_description ?: '-')->limit(120),
+            ]);
+    }
+
+    private function formatDuration(int|float $minutes): string
+    {
+        $minutes = max(0, (int) round($minutes));
+        $hours = intdiv($minutes, 60);
+        $remainingMinutes = $minutes % 60;
+
+        if ($hours >= 24) {
+            $days = intdiv($hours, 24);
+            $remainingHours = $hours % 24;
+
+            return trim($days.' days '.$remainingHours.' hours '.$remainingMinutes.' minutes');
+        }
+
+        if ($hours > 0) {
+            return trim($hours.' hours '.$remainingMinutes.' minutes');
+        }
+
+        return $remainingMinutes.' minutes';
     }
 
     private function cleanAndShiftMSProductData(): void

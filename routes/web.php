@@ -3,10 +3,9 @@
 use App\Http\Controllers\MobilesentrixController;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/', function () {
-    return view('welcome');
-});
+Route::get('/', [MobilesentrixController::class, 'Dashboard'])->name('ms-dashboard');
 
 Route::get('ms-category', [MobilesentrixController::class, 'MsCategory'])->name('ms-category');
 Route::get('ms-product', [MobilesentrixController::class, 'MsProduct'])->name('ms-product');
 Route::get('ms-product-sync', [MobilesentrixController::class, 'MsProductSync'])->name('ms-product-sync');
+Route::get('ms-products/export', [MobilesentrixController::class, 'ExportAllProducts'])->name('ms-products.export');
