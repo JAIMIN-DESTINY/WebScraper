@@ -15,6 +15,9 @@ return new class extends Migration
             $table->string('url')->unique();
             $table->unsignedTinyInteger('is_sync')->default(0)->index();
             $table->unsignedInteger('product_count')->default(0);
+            $table->dateTime('process_start_date')->nullable();
+            $table->dateTime('process_end_date')->nullable();
+            $table->decimal('sync_minutes', 10, 2)->nullable();
             $table->timestamps();
         });
     }

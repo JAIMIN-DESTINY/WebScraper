@@ -193,14 +193,14 @@ class MobilesentrixController extends Controller
     public function MsCategory(): JsonResponse
     {
         try {
-            $nodeResponse = Http::timeout(600)->get('https://node-scraper.asa2020.com/mobilesentrix/getCategory');
+            $nodeResponse = Http::timeout(600)->get('https://testing-scraper.asa2020.com/getCategory');
 
             if ($nodeResponse->failed()) {
                 MSSyncLog::create([
                     'category_name' => 'MobileSentrix Categories',
                     'message' => $nodeResponse->body(),
                     'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getCategory',
+                    'link' => 'https://testing-scraper.asa2020.com/getCategory',
                 ]);
 
                 return response()->json([
@@ -219,7 +219,7 @@ class MobilesentrixController extends Controller
                     'category_name' => 'MobileSentrix Categories',
                     'message' => 'Invalid node scraper response.',
                     'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getCategory',
+                    'link' => 'https://testing-scraper.asa2020.com/getCategory',
                 ]);
 
                 return response()->json([
@@ -296,7 +296,7 @@ class MobilesentrixController extends Controller
                 'category_name' => 'MobileSentrix Categories',
                 'message' => $exception->getMessage(),
                 'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getCategory',
+                'link' => 'https://testing-scraper.asa2020.com/getCategory',
             ]);
 
             return response()->json([
@@ -371,8 +371,15 @@ class MobilesentrixController extends Controller
                     'processing' => $stats['categories_processed'],
                 ]);
 
+                $categoryProcessStartedAt = now();
+                $categoryStartUpdate = $this->buildCategoryProcessTimingUpdate($categoryProcessStartedAt);
+
+                if ($categoryStartUpdate !== []) {
+                    $category->update($categoryStartUpdate);
+                }
+
                 try {
-                    $nodeResponse = Http::timeout(1200)->get('https://node-scraper.asa2020.com/mobilesentrix/getProduct', [
+                    $nodeResponse = Http::timeout(1200)->get('https://testing-scraper.asa2020.com/getProduct', [
                         'url' => $category->url,
                     ]);
 
@@ -391,7 +398,13 @@ class MobilesentrixController extends Controller
                             'message' => $nodeResponse->body(),
                         ];
 
-                        $category->touch();
+                        $categoryFailureUpdate = $this->buildCategoryProcessTimingUpdate($categoryProcessStartedAt, now());
+
+                        if ($categoryFailureUpdate !== []) {
+                            $category->update($categoryFailureUpdate);
+                        } else {
+                            $category->touch();
+                        }
 
                         continue;
                     }
@@ -414,7 +427,13 @@ class MobilesentrixController extends Controller
                             'message' => 'Invalid node scraper product response.',
                         ];
 
-                        $category->touch();
+                        $categoryFailureUpdate = $this->buildCategoryProcessTimingUpdate($categoryProcessStartedAt, now());
+
+                        if ($categoryFailureUpdate !== []) {
+                            $category->update($categoryFailureUpdate);
+                        } else {
+                            $category->touch();
+                        }
 
                         continue;
                     }
@@ -426,16 +445,20 @@ class MobilesentrixController extends Controller
                         $price = trim(preg_replace('/\s+/', ' ', (string) data_get($product, 'price')) ?? '');
                         $img = trim((string) data_get($product, 'img'));
                         $productUrl = trim((string) data_get($product, 'product_url'));
+                        $sku = trim((string) data_get($product, 'sku'));
+                        $description = trim((string) data_get($product, 'description'));
 
                         $name = $name === '' ? null : $name;
                         $price = $price === '' ? null : $price;
                         $img = $img === '' ? null : $img;
                         $productUrl = $productUrl === '' ? null : $productUrl;
+                        $sku = $sku === '' ? null : $sku;
+                        $description = $description === '' ? null : $description;
 
-                        if ($productUrl === null && $name === null) {
+                        if ($productUrl === null && $sku === null && $name === null) {
                             MSSyncLog::create([
                                 'category_name' => $category->name,
-                                'message' => 'Product skipped because product URL and name are missing.',
+                                'message' => 'Product skipped because product URL, SKU, and name are missing.',
                                 'status' => self::SYNC_LOG_STATUS_PRODUCT,
                                 'link' => $category->url,
                             ]);
@@ -451,7 +474,11 @@ class MobilesentrixController extends Controller
                             $msProduct = MSProduct::query()->where('product_url', $productUrl)->first();
                         }
 
-                        if ($msProduct === null && $productUrl === null && $name !== null) {
+                        if ($msProduct === null && $sku !== null) {
+                            $msProduct = MSProduct::query()->where('sku', $sku)->first();
+                        }
+
+                        if ($msProduct === null && $productUrl === null && $sku === null && $name !== null) {
                             $msProduct = MSProduct::query()
                                 ->where('ms_category_id', $category->id)
                                 ->where('name', $name)
@@ -467,6 +494,8 @@ class MobilesentrixController extends Controller
                             'price' => $price,
                             'img' => $img,
                             'product_url' => $productUrl,
+                            'sku' => $sku,
+                            'description' => $description,
                         ]);
 
                         $msProduct->save();
@@ -488,6 +517,7 @@ class MobilesentrixController extends Controller
                     $categoryUpdate = [
                         $statusColumn => self::CATEGORY_STATUS_COMPLETED,
                         'product_count' => $savedCount,
+                        ...$this->buildCategoryProcessTimingUpdate($categoryProcessStartedAt, now()),
                     ];
 
                     if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
@@ -525,7 +555,13 @@ class MobilesentrixController extends Controller
                         'message' => $exception->getMessage(),
                     ];
 
-                    $category->touch();
+                    $categoryFailureUpdate = $this->buildCategoryProcessTimingUpdate($categoryProcessStartedAt, now());
+
+                    if ($categoryFailureUpdate !== []) {
+                        $category->update($categoryFailureUpdate);
+                    } else {
+                        $category->touch();
+                    }
                 }
             }
 
@@ -554,7 +590,7 @@ class MobilesentrixController extends Controller
                 'category_name' => 'MobileSentrix Products',
                 'message' => $exception->getMessage(),
                 'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                'link' => 'https://node-scraper.asa2020.com/mobilesentrix/getProduct',
+                'link' => 'https://testing-scraper.asa2020.com/getProduct',
             ]);
 
             if ($scrapingLog !== null) {
@@ -777,6 +813,38 @@ class MobilesentrixController extends Controller
             ]);
     }
 
+    private function buildCategoryProcessTimingUpdate($startedAt, $finishedAt = null): array
+    {
+        $update = [];
+
+        if (Schema::hasColumn('ms_categories', 'process_start_date')) {
+            $update['process_start_date'] = $startedAt;
+        }
+
+        if ($finishedAt === null) {
+            if (Schema::hasColumn('ms_categories', 'process_end_date')) {
+                $update['process_end_date'] = null;
+            }
+
+            if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
+                $update['sync_minutes'] = null;
+            }
+
+            return $update;
+        }
+
+        if (Schema::hasColumn('ms_categories', 'process_end_date')) {
+            $update['process_end_date'] = $finishedAt;
+        }
+
+        if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
+            $seconds = abs($startedAt->diffInSeconds($finishedAt));
+            $update['sync_minutes'] = round($seconds / 60, 2);
+        }
+
+        return $update;
+    }
+
     private function formatDuration(int|float $minutes): string
     {
         $minutes = max(0, (int) round($minutes));
@@ -856,6 +924,18 @@ class MobilesentrixController extends Controller
 
                 if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
                     $categoryReset['is_sync'] = 0;
+                }
+
+                if (Schema::hasColumn('ms_categories', 'process_start_date')) {
+                    $categoryReset['process_start_date'] = null;
+                }
+
+                if (Schema::hasColumn('ms_categories', 'process_end_date')) {
+                    $categoryReset['process_end_date'] = null;
+                }
+
+                if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
+                    $categoryReset['sync_minutes'] = null;
                 }
 
                 DB::table('ms_categories')->update($categoryReset);
