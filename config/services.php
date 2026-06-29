@@ -35,4 +35,8 @@ return [
         ],
     ],
 
+    'mobilesentrix_scraper' => [
+        'url' => env('MOBILESENTRIX_SCRAPER_URL', 'http://127.0.0.1:3005'),
+    ],
+
 ];

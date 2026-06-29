@@ -42,6 +42,13 @@ class MobilesentrixController extends Controller
 
     private const DASHBOARD_SYNC_INTERVAL_DAYS = 7;
 
+    private function scraperUrl(string $path): string
+    {
+        $baseUrl = rtrim((string) config('services.mobilesentrix_scraper.url', 'http://127.0.0.1:3005'), '/');
+
+        return $baseUrl.'/'.ltrim($path, '/');
+    }
+
     public function Dashboard(Request $request)
     {
         $activeTable = $request->query('table', 'products');
@@ -192,15 +199,17 @@ class MobilesentrixController extends Controller
 
     public function MsCategory(): JsonResponse
     {
+        $categoryScraperUrl = $this->scraperUrl('getCategory');
+
         try {
-            $nodeResponse = Http::timeout(600)->get('https://testing-scraper.asa2020.com/getCategory');
+            $nodeResponse = Http::timeout(600)->get($categoryScraperUrl);
 
             if ($nodeResponse->failed()) {
                 MSSyncLog::create([
                     'category_name' => 'MobileSentrix Categories',
                     'message' => $nodeResponse->body(),
                     'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => 'https://testing-scraper.asa2020.com/getCategory',
+                    'link' => $categoryScraperUrl,
                 ]);
 
                 return response()->json([
@@ -219,7 +228,7 @@ class MobilesentrixController extends Controller
                     'category_name' => 'MobileSentrix Categories',
                     'message' => 'Invalid node scraper response.',
                     'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => 'https://testing-scraper.asa2020.com/getCategory',
+                    'link' => $categoryScraperUrl,
                 ]);
 
                 return response()->json([
@@ -296,7 +305,7 @@ class MobilesentrixController extends Controller
                 'category_name' => 'MobileSentrix Categories',
                 'message' => $exception->getMessage(),
                 'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                'link' => 'https://testing-scraper.asa2020.com/getCategory',
+                'link' => $categoryScraperUrl,
             ]);
 
             return response()->json([
@@ -308,6 +317,7 @@ class MobilesentrixController extends Controller
 
     public function MsProductSync(): JsonResponse
     {
+        $productScraperUrl = $this->scraperUrl('getProduct');
         $scrapingLog = null;
         $startedAt = now();
         $stats = [
@@ -379,7 +389,7 @@ class MobilesentrixController extends Controller
                 }
 
                 try {
-                    $nodeResponse = Http::timeout(1200)->get('https://testing-scraper.asa2020.com/getProduct', [
+                    $nodeResponse = Http::timeout(1200)->get($productScraperUrl, [
                         'url' => $category->url,
                     ]);
 
@@ -590,7 +600,7 @@ class MobilesentrixController extends Controller
                 'category_name' => 'MobileSentrix Products',
                 'message' => $exception->getMessage(),
                 'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                'link' => 'https://testing-scraper.asa2020.com/getProduct',
+                'link' => $productScraperUrl,
             ]);
 
             if ($scrapingLog !== null) {
