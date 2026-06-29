@@ -9,6 +9,7 @@ use App\Models\MSPriceCompare;
 use App\Models\MSProduct;
 use App\Models\MSScrapingLog;
 use App\Models\MSSyncLog;
+use Illuminate\Http\Client\Pool;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -616,14 +617,44 @@ class MobilesentrixController extends Controller
                     'updated_at' => now(),
                 ]);
 
-            $workerResponse = $this->MsProductSync();
-            $workers = [
-                'worker_1' => [
-                    'success' => $workerResponse->isSuccessful(),
-                    'status' => $workerResponse->getStatusCode(),
-                    'data' => $workerResponse->getData(true),
-                ],
-            ];
+            $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl): void {
+                for ($worker = 1; $worker <= self::PRODUCT_SYNC_WORKERS; $worker++) {
+                    $pool
+                        ->as('worker_'.$worker)
+                        ->timeout(1500)
+                        ->get($syncUrl);
+                }
+            }, self::PRODUCT_SYNC_WORKERS);
+
+            $workers = [];
+
+            foreach ($workerResponses as $workerName => $workerResponse) {
+                if ($workerResponse instanceof Throwable) {
+                    $workers[$workerName] = [
+                        'success' => false,
+                        'status' => 0,
+                        'data' => [
+                            'message' => $workerResponse->getMessage(),
+                        ],
+                    ];
+
+                    continue;
+                }
+
+                $responseData = $workerResponse->json();
+
+                if (! is_array($responseData)) {
+                    $responseData = [
+                        'body' => $workerResponse->body(),
+                    ];
+                }
+
+                $workers[$workerName] = [
+                    'success' => $workerResponse->successful(),
+                    'status' => $workerResponse->status(),
+                    'data' => $responseData,
+                ];
+            }
 
             $successful = collect($workers)->every(fn (array $worker): bool => $worker['success']);
 
