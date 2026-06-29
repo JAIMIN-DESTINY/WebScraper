@@ -425,20 +425,16 @@ class MobilesentrixController extends Controller
                         $price = trim(preg_replace('/\s+/', ' ', (string) data_get($product, 'price')) ?? '');
                         $img = trim((string) data_get($product, 'img'));
                         $productUrl = trim((string) data_get($product, 'product_url'));
-                        $sku = trim((string) data_get($product, 'sku'));
-                        $description = trim((string) data_get($product, 'description'));
 
                         $name = $name === '' ? null : $name;
                         $price = $price === '' ? null : $price;
                         $img = $img === '' ? null : $img;
                         $productUrl = $productUrl === '' ? null : $productUrl;
-                        $sku = $sku === '' ? null : $sku;
-                        $description = $description === '' ? null : $description;
 
-                        if ($productUrl === null && $sku === null && $name === null) {
+                        if ($productUrl === null && $name === null) {
                             MSSyncLog::create([
                                 'category_name' => $category->name,
-                                'message' => 'Product skipped because product URL, SKU, and name are missing.',
+                                'message' => 'Product skipped because product URL and name are missing.',
                                 'status' => self::SYNC_LOG_STATUS_PRODUCT,
                                 'link' => $category->url,
                             ]);
@@ -454,11 +450,7 @@ class MobilesentrixController extends Controller
                             $msProduct = MSProduct::query()->where('product_url', $productUrl)->first();
                         }
 
-                        if ($msProduct === null && $sku !== null) {
-                            $msProduct = MSProduct::query()->where('sku', $sku)->first();
-                        }
-
-                        if ($msProduct === null && $productUrl === null && $sku === null && $name !== null) {
+                        if ($msProduct === null && $productUrl === null && $name !== null) {
                             $msProduct = MSProduct::query()
                                 ->where('ms_category_id', $category->id)
                                 ->where('name', $name)
@@ -474,8 +466,6 @@ class MobilesentrixController extends Controller
                             'price' => $price,
                             'img' => $img,
                             'product_url' => $productUrl,
-                            'sku' => $sku,
-                            'description' => $description,
                         ]);
 
                         $msProduct->save();
