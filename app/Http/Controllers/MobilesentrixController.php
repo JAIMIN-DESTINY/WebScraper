@@ -29,6 +29,10 @@ class MobilesentrixController extends Controller
 
     private const DEFAULT_PRODUCT_SYNC_WORKERS = 25;
 
+    private const DEFAULT_PRODUCT_SYNC_CATEGORY_DELAY_SECONDS = 3;
+
+    private const DEFAULT_PRODUCT_SYNC_MAX_ROUNDS = 0;
+
     private const SYNC_LOG_STATUS_CATEGORY = 0;
 
     private const SYNC_LOG_STATUS_PRODUCT = 1;
@@ -47,30 +51,9 @@ class MobilesentrixController extends Controller
 
     private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
 
-    private function scraperBaseUrls(): array
+    private function scraperUrl(string $path): string
     {
-        $urls = config('services.mobilesentrix_scraper.urls', []);
-
-        if (! is_array($urls) || $urls === []) {
-            $urls = [config('services.mobilesentrix_scraper.url', 'http://127.0.0.1:3005')];
-        }
-
-        return array_values(array_filter(
-            array_map(
-                static fn ($url): string => rtrim((string) $url, '/'),
-                $urls
-            )
-        )) ?: ['http://127.0.0.1:3005'];
-    }
-
-    private function scraperUrl(string $path, int|string|null $shardKey = null): string
-    {
-        $baseUrls = $this->scraperBaseUrls();
-        $baseUrl = $baseUrls[0];
-
-        if ($shardKey !== null && count($baseUrls) > 1) {
-            $baseUrl = $baseUrls[abs(crc32((string) $shardKey)) % count($baseUrls)];
-        }
+        $baseUrl = rtrim((string) config('services.mobilesentrix_scraper.url', 'http://127.0.0.1:3005'), '/');
 
         return $baseUrl.'/'.ltrim($path, '/');
     }
@@ -78,8 +61,24 @@ class MobilesentrixController extends Controller
     private function productSyncWorkers(): int
     {
         return max(1, min(
-            200,
+            50,
             (int) config('services.mobilesentrix_scraper.product_sync_workers', self::DEFAULT_PRODUCT_SYNC_WORKERS)
+        ));
+    }
+
+    private function productSyncCategoryDelaySeconds(): int
+    {
+        return max(0, min(
+            60,
+            (int) config('services.mobilesentrix_scraper.product_sync_category_delay_seconds', self::DEFAULT_PRODUCT_SYNC_CATEGORY_DELAY_SECONDS)
+        ));
+    }
+
+    private function productSyncMaxRounds(): int
+    {
+        return max(0, min(
+            1000,
+            (int) config('services.mobilesentrix_scraper.product_sync_max_rounds', self::DEFAULT_PRODUCT_SYNC_MAX_ROUNDS)
         ));
     }
 
@@ -391,7 +390,6 @@ class MobilesentrixController extends Controller
                     break;
                 }
 
-                $productScraperUrl = $this->scraperUrl('getProduct', $category->id);
                 $stats['categories_processed']++;
                 $this->updateProductScrapingLog($scrapingLog, $stats);
 
@@ -589,6 +587,8 @@ class MobilesentrixController extends Controller
                     } else {
                         $category->touch();
                     }
+                } finally {
+                    $this->pauseBeforeNextProductSyncCategory();
                 }
             }
 
@@ -636,6 +636,10 @@ class MobilesentrixController extends Controller
         $syncUrl = $request->getSchemeAndHttpHost().route('ms-product-sync', [], false);
 
         try {
+            if (function_exists('set_time_limit')) {
+                set_time_limit(0);
+            }
+
             $today = today()->toDateString();
             $lastSyncDate = DB::table('ms_sync_settings')
                 ->where('id', 1)
@@ -663,62 +667,58 @@ class MobilesentrixController extends Controller
             }
 
             $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
-
-            MSCategory::query()
-                ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
-                ->update([
-                    $statusColumn => self::CATEGORY_STATUS_PENDING,
-                    'updated_at' => now(),
-                ]);
-
             $workerCount = $this->productSyncWorkers();
-
-            $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
-                for ($worker = 1; $worker <= $workerCount; $worker++) {
-                    $pool
-                        ->as('worker_'.$worker)
-                        ->timeout(1500)
-                        ->get($syncUrl);
-                }
-            }, $workerCount);
-
+            $maxRounds = $this->productSyncMaxRounds();
+            $rounds = [];
             $workers = [];
+            $pendingCategories = 0;
+            $round = 0;
 
-            foreach ($workerResponses as $workerName => $workerResponse) {
-                if ($workerResponse instanceof Throwable) {
-                    $workers[$workerName] = [
-                        'success' => false,
-                        'status' => 0,
-                        'data' => [
-                            'message' => $workerResponse->getMessage(),
-                        ],
-                    ];
+            while (true) {
+                $this->resetWorkingProductSyncCategories($statusColumn);
 
-                    continue;
+                $pendingBefore = $this->pendingProductSyncCategoryCount($statusColumn);
+
+                if ($pendingBefore === 0) {
+                    $pendingCategories = 0;
+                    break;
                 }
 
-                $responseData = $workerResponse->json();
-
-                if (! is_array($responseData)) {
-                    $responseData = [
-                        'body' => $workerResponse->body(),
-                    ];
+                if ($maxRounds > 0 && $round >= $maxRounds) {
+                    $pendingCategories = $pendingBefore;
+                    break;
                 }
 
-                $workers[$workerName] = [
-                    'success' => $workerResponse->successful(),
-                    'status' => $workerResponse->status(),
-                    'data' => $responseData,
+                $round++;
+                $workerResponses = $this->runProductSyncWorkerPool($syncUrl, $workerCount);
+                $workers = $this->normalizeProductSyncWorkerResponses($workerResponses);
+
+                $this->resetWorkingProductSyncCategories($statusColumn);
+
+                $pendingCategories = $this->pendingProductSyncCategoryCount($statusColumn);
+                $rounds[] = [
+                    'round' => $round,
+                    'pending_before' => $pendingBefore,
+                    'pending_after' => $pendingCategories,
+                    'worker_success' => collect($workers)->every(fn (array $worker): bool => $worker['success']),
                 ];
+
+                if ($pendingCategories === 0) {
+                    break;
+                }
             }
 
-            $successful = collect($workers)->every(fn (array $worker): bool => $worker['success']);
+            $successful = $pendingCategories === 0;
 
             return response()->json([
                 'success' => $successful,
-                'message' => 'MobileSentrix product sync workers completed.',
+                'message' => $successful
+                    ? 'MobileSentrix product sync workers completed.'
+                    : 'MobileSentrix product sync stopped before all categories completed.',
                 'worker_count' => $workerCount,
-                'scraper_count' => count($this->scraperBaseUrls()),
+                'round_count' => $round,
+                'pending_categories' => $pendingCategories,
+                'rounds' => $rounds,
                 'workers' => $workers,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
@@ -974,6 +974,81 @@ class MobilesentrixController extends Controller
                 return $category->refresh();
             }
         }
+    }
+
+    private function pauseBeforeNextProductSyncCategory(): void
+    {
+        $delaySeconds = $this->productSyncCategoryDelaySeconds();
+
+        if ($delaySeconds > 0) {
+            sleep($delaySeconds);
+        }
+    }
+
+    private function pendingProductSyncCategoryCount(string $statusColumn): int
+    {
+        return MSCategory::query()
+            ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+            ->whereNotNull('url')
+            ->where('url', '<>', '')
+            ->count();
+    }
+
+    private function resetWorkingProductSyncCategories(string $statusColumn): void
+    {
+        MSCategory::query()
+            ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
+            ->update([
+                $statusColumn => self::CATEGORY_STATUS_PENDING,
+                'updated_at' => now(),
+            ]);
+    }
+
+    private function runProductSyncWorkerPool(string $syncUrl, int $workerCount): array
+    {
+        return Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
+            for ($worker = 1; $worker <= $workerCount; $worker++) {
+                $pool
+                    ->as('worker_'.$worker)
+                    ->timeout(1500)
+                    ->get($syncUrl);
+            }
+        }, $workerCount);
+    }
+
+    private function normalizeProductSyncWorkerResponses(array $workerResponses): array
+    {
+        $workers = [];
+
+        foreach ($workerResponses as $workerName => $workerResponse) {
+            if ($workerResponse instanceof Throwable) {
+                $workers[$workerName] = [
+                    'success' => false,
+                    'status' => 0,
+                    'data' => [
+                        'message' => $workerResponse->getMessage(),
+                    ],
+                ];
+
+                continue;
+            }
+
+            $responseData = $workerResponse->json();
+
+            if (! is_array($responseData)) {
+                $responseData = [
+                    'body' => $workerResponse->body(),
+                ];
+            }
+
+            $workers[$workerName] = [
+                'success' => $workerResponse->successful(),
+                'status' => $workerResponse->status(),
+                'data' => $responseData,
+            ];
+        }
+
+        return $workers;
     }
 
     private function findExistingMSProduct(int $categoryId, ?string $productUrl, ?string $sku, ?string $name): ?MSProduct
