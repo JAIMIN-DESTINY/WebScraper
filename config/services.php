@@ -34,12 +34,4 @@ return [
             'channel' => env('SLACK_BOT_USER_DEFAULT_CHANNEL'),
         ],
     ],
-
-    'mobilesentrix_scraper' => [
-        'url' => env('MOBILESENTRIX_SCRAPER_URL', 'http://127.0.0.1:3005'),
-        'product_sync_workers' => env('PRODUCT_SYNC_WORKERS', 25),
-        'product_sync_category_delay_seconds' => env('PRODUCT_SYNC_CATEGORY_DELAY_SECONDS', 3),
-        'product_sync_max_rounds' => env('PRODUCT_SYNC_MAX_ROUNDS', 0),
-    ],
-
 ];
