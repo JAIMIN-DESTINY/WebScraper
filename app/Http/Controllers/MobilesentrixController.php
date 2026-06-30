@@ -35,7 +35,7 @@ class MobilesentrixController extends Controller
     private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
     private const CATEGORY_SCRAPER_URL = 'http://127.0.0.1:3005/getCategory';
     private const PRODUCT_SCRAPER_URL = 'http://127.0.0.1:3005/getProduct';
-    private const PRODUCT_SYNC_WORKERS = 25;
+    private const PRODUCT_SYNC_WORKERS = 100;
     private const PRODUCT_SYNC_CATEGORY_DELAY_SECONDS = 0;
     private const PRODUCT_SYNC_MAX_ROUNDS = 0;
 
