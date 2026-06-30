@@ -10,6 +10,7 @@ return new class extends Migration
     {
         Schema::create('ms_scraping_log', function (Blueprint $table) {
             $table->id();
+            $table->date('log_date')->unique()->comment('One scraping log row per date.');
             $table->dateTime('start_time')->comment('Scraping process start time.');
             $table->dateTime('end_time')->nullable()->comment('Scraping process end time.');
             $table->unsignedInteger('product_count')->default(0)->comment('Total products synced during scraping.');

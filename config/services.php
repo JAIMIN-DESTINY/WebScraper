@@ -37,6 +37,7 @@ return [
 
     'mobilesentrix_scraper' => [
         'url' => env('MOBILESENTRIX_SCRAPER_URL', 'http://127.0.0.1:3005'),
+        'product_sync_workers' => env('PRODUCT_SYNC_WORKERS', 25),
     ],
 
 ];

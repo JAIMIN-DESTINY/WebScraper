@@ -10,6 +10,7 @@ use App\Models\MSProduct;
 use App\Models\MSScrapingLog;
 use App\Models\MSSyncLog;
 use Illuminate\Http\Client\Pool;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -26,7 +27,7 @@ class MobilesentrixController extends Controller
 
     private const CATEGORY_STATUS_COMPLETED = 2;
 
-    private const PRODUCT_SYNC_WORKERS = 5;
+    private const DEFAULT_PRODUCT_SYNC_WORKERS = 25;
 
     private const SYNC_LOG_STATUS_CATEGORY = 0;
 
@@ -42,11 +43,38 @@ class MobilesentrixController extends Controller
 
     private const DASHBOARD_SYNC_INTERVAL_DAYS = 7;
 
+    private const SYNC_LOG_LINK_CATEGORY_RUN = 'ms-category';
+
+    private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
+
     private function scraperUrl(string $path): string
     {
         $baseUrl = rtrim((string) config('services.mobilesentrix_scraper.url', 'http://127.0.0.1:3005'), '/');
 
         return $baseUrl.'/'.ltrim($path, '/');
+    }
+
+    private function productSyncWorkers(): int
+    {
+        return max(1, min(
+            50,
+            (int) config('services.mobilesentrix_scraper.product_sync_workers', self::DEFAULT_PRODUCT_SYNC_WORKERS)
+        ));
+    }
+
+    private function syncLog(string $categoryName, string $message, int $status, ?string $link = null): void
+    {
+        MSSyncLog::updateOrCreate(
+            [
+                'status' => $status,
+                'link' => $link,
+            ],
+            [
+                'category_name' => $categoryName,
+                'message' => str($message)->limit(2000)->toString(),
+                'updated_at' => now(),
+            ]
+        );
     }
 
     public function Dashboard(Request $request)
@@ -205,12 +233,12 @@ class MobilesentrixController extends Controller
             $nodeResponse = Http::timeout(600)->get($categoryScraperUrl);
 
             if ($nodeResponse->failed()) {
-                MSSyncLog::create([
-                    'category_name' => 'MobileSentrix Categories',
-                    'message' => $nodeResponse->body(),
-                    'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => $categoryScraperUrl,
-                ]);
+                $this->syncLog(
+                    'MobileSentrix Categories',
+                    $nodeResponse->body(),
+                    self::SYNC_LOG_STATUS_CATEGORY,
+                    self::SYNC_LOG_LINK_CATEGORY_RUN
+                );
 
                 return response()->json([
                     'success' => false,
@@ -224,12 +252,12 @@ class MobilesentrixController extends Controller
             $groups = data_get($payload, 'data', []);
 
             if (! is_array($groups)) {
-                MSSyncLog::create([
-                    'category_name' => 'MobileSentrix Categories',
-                    'message' => 'Invalid node scraper response.',
-                    'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                    'link' => $categoryScraperUrl,
-                ]);
+                $this->syncLog(
+                    'MobileSentrix Categories',
+                    'Invalid node scraper response.',
+                    self::SYNC_LOG_STATUS_CATEGORY,
+                    self::SYNC_LOG_LINK_CATEGORY_RUN
+                );
 
                 return response()->json([
                     'success' => false,
@@ -280,18 +308,12 @@ class MobilesentrixController extends Controller
                     ['maincatagory', 'name', 'updated_at']
                 );
 
-                foreach ($rows as $row) {
-                    MSSyncLog::updateOrCreate(
-                        [
-                            'status' => self::SYNC_LOG_STATUS_COMPLETED,
-                            'link' => $row['url'],
-                        ],
-                        [
-                            'category_name' => $row['name'],
-                            'message' => 'MobileSentrix category synced successfully.',
-                        ]
-                    );
-                }
+                $this->syncLog(
+                    'MobileSentrix Categories',
+                    'MobileSentrix categories synced successfully. Category count: '.count($rows).'.',
+                    self::SYNC_LOG_STATUS_COMPLETED,
+                    self::SYNC_LOG_LINK_CATEGORY_RUN
+                );
             }
 
             return response()->json([
@@ -301,12 +323,12 @@ class MobilesentrixController extends Controller
                 'category_count' => count($rows),
             ]);
         } catch (Throwable $exception) {
-            MSSyncLog::create([
-                'category_name' => 'MobileSentrix Categories',
-                'message' => $exception->getMessage(),
-                'status' => self::SYNC_LOG_STATUS_CATEGORY,
-                'link' => $categoryScraperUrl,
-            ]);
+            $this->syncLog(
+                'MobileSentrix Categories',
+                $exception->getMessage(),
+                self::SYNC_LOG_STATUS_CATEGORY,
+                self::SYNC_LOG_LINK_CATEGORY_RUN
+            );
 
             return response()->json([
                 'success' => false,
@@ -339,47 +361,17 @@ class MobilesentrixController extends Controller
                 ->where('url', '<>', '')
                 ->count();
 
-            $scrapingLog = MSScrapingLog::create([
-                'start_time' => $startedAt,
-                'product_count' => 0,
-                'category_count' => $categoryCount,
-                'processing' => 0,
-                'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
-                'created_at' => $startedAt,
-                'updated_at' => $startedAt,
-            ]);
+            $scrapingLog = $this->startProductScrapingLog($categoryCount, $startedAt);
 
             while (true) {
-                while (true) {
-                    $category = MSCategory::query()
-                        ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
-                        ->whereNotNull('url')
-                        ->where('url', '<>', '')
-                        ->orderBy('id')
-                        ->first();
+                $category = $this->claimNextProductSyncCategory($statusColumn);
 
-                    if ($category === null) {
-                        break 2;
-                    }
-
-                    $claimed = MSCategory::query()
-                        ->whereKey($category->id)
-                        ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
-                        ->update([
-                            $statusColumn => self::CATEGORY_STATUS_WORKING,
-                            'updated_at' => now(),
-                        ]);
-
-                    if ($claimed === 1) {
-                        $category->refresh();
-                        break;
-                    }
+                if ($category === null) {
+                    break;
                 }
 
                 $stats['categories_processed']++;
-                $scrapingLog->update([
-                    'processing' => $stats['categories_processed'],
-                ]);
+                $this->updateProductScrapingLog($scrapingLog, $stats);
 
                 $categoryProcessStartedAt = now();
                 $categoryStartUpdate = $this->buildCategoryProcessTimingUpdate($categoryProcessStartedAt);
@@ -394,12 +386,12 @@ class MobilesentrixController extends Controller
                     ]);
 
                     if ($nodeResponse->failed()) {
-                        MSSyncLog::create([
-                            'category_name' => $category->name,
-                            'message' => $nodeResponse->body(),
-                            'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                            'link' => $category->url,
-                        ]);
+                        $this->syncLog(
+                            $category->name,
+                            $nodeResponse->body(),
+                            self::SYNC_LOG_STATUS_PRODUCT,
+                            $category->url
+                        );
 
                         $stats['failed_categories'][] = [
                             'category_id' => $category->id,
@@ -423,12 +415,12 @@ class MobilesentrixController extends Controller
                     $products = data_get($payload, 'data', []);
 
                     if (! is_array($products)) {
-                        MSSyncLog::create([
-                            'category_name' => $category->name,
-                            'message' => 'Invalid node scraper product response.',
-                            'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                            'link' => $category->url,
-                        ]);
+                        $this->syncLog(
+                            $category->name,
+                            'Invalid node scraper product response.',
+                            self::SYNC_LOG_STATUS_PRODUCT,
+                            $category->url
+                        );
 
                         $stats['failed_categories'][] = [
                             'category_id' => $category->id,
@@ -466,13 +458,6 @@ class MobilesentrixController extends Controller
                         $description = $description === '' ? null : $description;
 
                         if ($productUrl === null && $sku === null && $name === null) {
-                            MSSyncLog::create([
-                                'category_name' => $category->name,
-                                'message' => 'Product skipped because product URL, SKU, and name are missing.',
-                                'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                                'link' => $category->url,
-                            ]);
-
                             $stats['products_skipped']++;
 
                             continue;
@@ -508,7 +493,31 @@ class MobilesentrixController extends Controller
                             'description' => $description,
                         ]);
 
-                        $msProduct->save();
+                        try {
+                            $msProduct->save();
+                        } catch (QueryException $exception) {
+                            if (! $this->isDuplicateProductWriteException($exception)) {
+                                throw $exception;
+                            }
+
+                            $msProduct = $this->findExistingMSProduct($category->id, $productUrl, $sku, $name);
+
+                            if ($msProduct === null) {
+                                throw $exception;
+                            }
+
+                            $isNew = false;
+                            $msProduct->fill([
+                                'ms_category_id' => $category->id,
+                                'name' => $name,
+                                'price' => $price,
+                                'img' => $img,
+                                'product_url' => $productUrl,
+                                'sku' => $sku,
+                                'description' => $description,
+                            ]);
+                            $msProduct->save();
+                        }
                         $savedCount++;
 
                         if ($isNew) {
@@ -519,10 +528,7 @@ class MobilesentrixController extends Controller
                     }
 
                     $stats['products_fetched'] += count($products);
-                    $scrapingLog->update([
-                        'product_count' => $stats['products_fetched'],
-                        'processing' => $stats['categories_processed'],
-                    ]);
+                    $this->updateProductScrapingLog($scrapingLog, $stats);
 
                     $categoryUpdate = [
                         $statusColumn => self::CATEGORY_STATUS_COMPLETED,
@@ -536,27 +542,16 @@ class MobilesentrixController extends Controller
 
                     $category->update($categoryUpdate);
 
-                    MSSyncLog::updateOrCreate(
-                        [
-                            'status' => self::SYNC_LOG_STATUS_COMPLETED,
-                            'link' => $category->url,
-                        ],
-                        [
-                            'category_name' => $category->name,
-                            'message' => 'MobileSentrix products synced successfully.',
-                        ]
-                    );
-
                     $compareStats = $this->compareMSProductData($category->id);
                     $stats['price_changes'] += $compareStats['price_changes'];
                     $stats['description_changes'] += $compareStats['description_changes'];
                 } catch (Throwable $exception) {
-                    MSSyncLog::create([
-                        'category_name' => $category->name,
-                        'message' => $exception->getMessage(),
-                        'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                        'link' => $category->url,
-                    ]);
+                    $this->syncLog(
+                        $category->name,
+                        $exception->getMessage(),
+                        self::SYNC_LOG_STATUS_PRODUCT,
+                        $category->url
+                    );
 
                     $stats['failed_categories'][] = [
                         'category_id' => $category->id,
@@ -576,17 +571,16 @@ class MobilesentrixController extends Controller
             }
 
             $successful = $stats['failed_categories'] === [];
-            $finishedAt = now();
+            $scrapingLog = $this->updateProductScrapingLog($scrapingLog, $stats, true);
 
-            $scrapingLog->update([
-                'end_time' => $finishedAt,
-                'product_count' => $stats['products_fetched'],
-                'processing' => $stats['categories_processed'],
-                'status' => $successful
-                    ? self::SCRAPING_LOG_STATUS_COMPLETED
-                    : self::SCRAPING_LOG_STATUS_ISSUE,
-                'updated_at' => $finishedAt,
-            ]);
+            if (in_array($scrapingLog->status, [self::SCRAPING_LOG_STATUS_COMPLETED, self::SCRAPING_LOG_STATUS_ISSUE], true)) {
+                $this->syncLog(
+                    'MobileSentrix Products',
+                    'MobileSentrix product sync '.($scrapingLog->status === self::SCRAPING_LOG_STATUS_COMPLETED ? 'completed' : 'completed with issues').'. Products: '.$scrapingLog->product_count.', categories processed: '.$scrapingLog->processing.'/'.$scrapingLog->category_count.'.',
+                    self::SYNC_LOG_STATUS_COMPLETED,
+                    self::SYNC_LOG_LINK_PRODUCT_RUN
+                );
+            }
 
             return response()->json([
                 'success' => $successful,
@@ -596,23 +590,15 @@ class MobilesentrixController extends Controller
                 ...$stats,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
-            MSSyncLog::create([
-                'category_name' => 'MobileSentrix Products',
-                'message' => $exception->getMessage(),
-                'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                'link' => $productScraperUrl,
-            ]);
+            $this->syncLog(
+                'MobileSentrix Products',
+                $exception->getMessage(),
+                self::SYNC_LOG_STATUS_PRODUCT,
+                self::SYNC_LOG_LINK_PRODUCT_RUN
+            );
 
             if ($scrapingLog !== null) {
-                $finishedAt = now();
-
-                $scrapingLog->update([
-                    'end_time' => $finishedAt,
-                    'product_count' => $stats['products_fetched'],
-                    'processing' => $stats['categories_processed'],
-                    'status' => self::SCRAPING_LOG_STATUS_ISSUE,
-                    'updated_at' => $finishedAt,
-                ]);
+                $this->updateProductScrapingLog($scrapingLog, $stats, true, true);
             }
 
             return response()->json([
@@ -663,14 +649,16 @@ class MobilesentrixController extends Controller
                     'updated_at' => now(),
                 ]);
 
-            $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl): void {
-                for ($worker = 1; $worker <= self::PRODUCT_SYNC_WORKERS; $worker++) {
+            $workerCount = $this->productSyncWorkers();
+
+            $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
+                for ($worker = 1; $worker <= $workerCount; $worker++) {
                     $pool
                         ->as('worker_'.$worker)
                         ->timeout(1500)
                         ->get($syncUrl);
                 }
-            }, self::PRODUCT_SYNC_WORKERS);
+            }, $workerCount);
 
             $workers = [];
 
@@ -707,16 +695,16 @@ class MobilesentrixController extends Controller
             return response()->json([
                 'success' => $successful,
                 'message' => 'MobileSentrix product sync workers completed.',
-                'worker_count' => self::PRODUCT_SYNC_WORKERS,
+                'worker_count' => $workerCount,
                 'workers' => $workers,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
-            MSSyncLog::create([
-                'category_name' => 'MobileSentrix Products',
-                'message' => $exception->getMessage(),
-                'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                'link' => $syncUrl,
-            ]);
+            $this->syncLog(
+                'MobileSentrix Products',
+                $exception->getMessage(),
+                self::SYNC_LOG_STATUS_PRODUCT,
+                self::SYNC_LOG_LINK_PRODUCT_RUN
+            );
 
             return response()->json([
                 'success' => false,
@@ -821,6 +809,223 @@ class MobilesentrixController extends Controller
                 'Old Value' => str($change->old_description ?: '-')->limit(120),
                 'New Value' => str($change->new_description ?: '-')->limit(120),
             ]);
+    }
+
+    private function startProductScrapingLog(int $categoryCount, $startedAt): MSScrapingLog
+    {
+        $today = today()->toDateString();
+        $now = now();
+
+        if (Schema::hasColumn('ms_scraping_log', 'log_date')) {
+            DB::table('ms_scraping_log')->insertOrIgnore([
+                'log_date' => $today,
+                'start_time' => $startedAt,
+                'product_count' => 0,
+                'category_count' => $categoryCount,
+                'processing' => 0,
+                'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
+                'created_at' => $startedAt,
+                'updated_at' => $startedAt,
+            ]);
+
+            DB::table('ms_scraping_log')
+                ->where('log_date', $today)
+                ->update([
+                    'category_count' => $categoryCount,
+                    'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
+                    'end_time' => null,
+                    'updated_at' => $now,
+                ]);
+
+            return MSScrapingLog::query()
+                ->where('log_date', $today)
+                ->firstOrFail();
+        }
+
+        $scrapingLog = MSScrapingLog::query()
+            ->where('start_time', '>=', today())
+            ->where('start_time', '<', today()->copy()->addDay())
+            ->first();
+
+        if ($scrapingLog !== null) {
+            $scrapingLog->update([
+                'category_count' => $categoryCount,
+                'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
+                'end_time' => null,
+                'updated_at' => $now,
+            ]);
+
+            return $scrapingLog->refresh();
+        }
+
+        return MSScrapingLog::create([
+            'start_time' => $startedAt,
+            'product_count' => 0,
+            'category_count' => $categoryCount,
+            'processing' => 0,
+            'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
+            'created_at' => $startedAt,
+            'updated_at' => $startedAt,
+        ]);
+    }
+
+    private function updateProductScrapingLog(
+        ?MSScrapingLog $scrapingLog,
+        array $stats = [],
+        bool $finished = false,
+        bool $forceIssue = false
+    ): ?MSScrapingLog {
+        if ($scrapingLog === null) {
+            return null;
+        }
+
+        $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
+        $categoryQuery = MSCategory::query()
+            ->whereNotNull('url')
+            ->where('url', '<>', '');
+        $categoryCount = (clone $categoryQuery)->count();
+        $completedCategories = (clone $categoryQuery)
+            ->where($statusColumn, self::CATEGORY_STATUS_COMPLETED)
+            ->count();
+        $pendingCategories = (clone $categoryQuery)
+            ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+            ->count();
+        $workingCategories = (clone $categoryQuery)
+            ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
+            ->count();
+        $hasFailures = $forceIssue || (($stats['failed_categories'] ?? []) !== []);
+        $status = $scrapingLog->status;
+        $finishedAt = null;
+
+        if ($finished) {
+            if ($pendingCategories === 0 && $workingCategories === 0) {
+                $status = $hasFailures
+                    ? self::SCRAPING_LOG_STATUS_ISSUE
+                    : self::SCRAPING_LOG_STATUS_COMPLETED;
+                $finishedAt = now();
+            } elseif ($pendingCategories === 0) {
+                $status = self::SCRAPING_LOG_STATUS_ISSUE;
+                $finishedAt = now();
+            } else {
+                $status = self::SCRAPING_LOG_STATUS_PROCESSING;
+            }
+        } elseif ($status !== self::SCRAPING_LOG_STATUS_ISSUE) {
+            $status = self::SCRAPING_LOG_STATUS_PROCESSING;
+        }
+
+        $scrapingLog->update([
+            'end_time' => $finishedAt,
+            'product_count' => MSProduct::query()->count(),
+            'category_count' => $categoryCount,
+            'processing' => $completedCategories,
+            'status' => $status,
+            'updated_at' => now(),
+        ]);
+
+        return $scrapingLog->refresh();
+    }
+
+    private function claimNextProductSyncCategory(string $statusColumn): ?MSCategory
+    {
+        while (true) {
+            $category = MSCategory::query()
+                ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+                ->whereNotNull('url')
+                ->where('url', '<>', '')
+                ->orderBy('id')
+                ->first();
+
+            if ($category === null) {
+                return null;
+            }
+
+            $claimed = MSCategory::query()
+                ->whereKey($category->id)
+                ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+                ->update([
+                    $statusColumn => self::CATEGORY_STATUS_WORKING,
+                    'updated_at' => now(),
+                ]);
+
+            if ($claimed === 1) {
+                return $category->refresh();
+            }
+        }
+    }
+
+    private function findExistingMSProduct(int $categoryId, ?string $productUrl, ?string $sku, ?string $name): ?MSProduct
+    {
+        if ($productUrl !== null) {
+            $product = MSProduct::query()->where('product_url', $productUrl)->first();
+
+            if ($product !== null) {
+                return $product;
+            }
+        }
+
+        if ($sku !== null) {
+            $product = MSProduct::query()->where('sku', $sku)->first();
+
+            if ($product !== null) {
+                return $product;
+            }
+        }
+
+        if ($productUrl === null && $sku === null && $name !== null) {
+            return MSProduct::query()
+                ->where('ms_category_id', $categoryId)
+                ->where('name', $name)
+                ->first();
+        }
+
+        return null;
+    }
+
+    private function isDuplicateProductWriteException(QueryException $exception): bool
+    {
+        $sqlState = (string) ($exception->errorInfo[0] ?? '');
+        $driverCode = (string) ($exception->errorInfo[1] ?? '');
+
+        return $sqlState === '23000' || in_array($driverCode, ['1062', '19'], true);
+    }
+
+    private function cleanupMSSyncLogs(): void
+    {
+        if (! Schema::hasTable('ms_sync_logs')) {
+            return;
+        }
+
+        DB::table('ms_sync_logs')
+            ->where('status', self::SYNC_LOG_STATUS_COMPLETED)
+            ->whereNotIn('link', [
+                self::SYNC_LOG_LINK_CATEGORY_RUN,
+                self::SYNC_LOG_LINK_PRODUCT_RUN,
+            ])
+            ->delete();
+
+        DB::table('ms_sync_logs')
+            ->where('updated_at', '<', now()->subDays(14))
+            ->delete();
+
+        $seen = [];
+        $logs = DB::table('ms_sync_logs')
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->get(['id', 'status', 'link']);
+
+        foreach ($logs as $log) {
+            $key = $log->status.'|'.($log->link ?? '');
+
+            if (isset($seen[$key])) {
+                DB::table('ms_sync_logs')
+                    ->where('id', $log->id)
+                    ->delete();
+
+                continue;
+            }
+
+            $seen[$key] = true;
+        }
     }
 
     private function buildCategoryProcessTimingUpdate($startedAt, $finishedAt = null): array
@@ -949,7 +1154,7 @@ class MobilesentrixController extends Controller
                 }
 
                 DB::table('ms_categories')->update($categoryReset);
-                DB::table('ms_sync_logs')->delete();
+                $this->cleanupMSSyncLogs();
 
                 DB::table('ms_sync_settings')->updateOrInsert(
                     ['id' => 1],
@@ -961,12 +1166,12 @@ class MobilesentrixController extends Controller
                 );
             });
         } catch (Throwable $exception) {
-            MSSyncLog::create([
-                'category_name' => 'MobileSentrix Products',
-                'message' => 'Failed to prepare new product sync: '.$exception->getMessage(),
-                'status' => self::SYNC_LOG_STATUS_PRODUCT,
-                'link' => 'ms-product',
-            ]);
+            $this->syncLog(
+                'MobileSentrix Products',
+                'Failed to prepare new product sync: '.$exception->getMessage(),
+                self::SYNC_LOG_STATUS_PRODUCT,
+                self::SYNC_LOG_LINK_PRODUCT_RUN
+            );
 
             throw $exception;
         }

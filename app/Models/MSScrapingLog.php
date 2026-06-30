@@ -11,6 +11,7 @@ class MSScrapingLog extends Model
     protected $guarded = [];
 
     protected $casts = [
+        'log_date' => 'date',
         'start_time' => 'datetime',
         'end_time' => 'datetime',
     ];
