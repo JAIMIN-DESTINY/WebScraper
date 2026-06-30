@@ -47,9 +47,30 @@ class MobilesentrixController extends Controller
 
     private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
 
-    private function scraperUrl(string $path): string
+    private function scraperBaseUrls(): array
     {
-        $baseUrl = rtrim((string) config('services.mobilesentrix_scraper.url', 'http://127.0.0.1:3005'), '/');
+        $urls = config('services.mobilesentrix_scraper.urls', []);
+
+        if (! is_array($urls) || $urls === []) {
+            $urls = [config('services.mobilesentrix_scraper.url', 'http://127.0.0.1:3005')];
+        }
+
+        return array_values(array_filter(
+            array_map(
+                static fn ($url): string => rtrim((string) $url, '/'),
+                $urls
+            )
+        )) ?: ['http://127.0.0.1:3005'];
+    }
+
+    private function scraperUrl(string $path, int|string|null $shardKey = null): string
+    {
+        $baseUrls = $this->scraperBaseUrls();
+        $baseUrl = $baseUrls[0];
+
+        if ($shardKey !== null && count($baseUrls) > 1) {
+            $baseUrl = $baseUrls[abs(crc32((string) $shardKey)) % count($baseUrls)];
+        }
 
         return $baseUrl.'/'.ltrim($path, '/');
     }
@@ -57,7 +78,7 @@ class MobilesentrixController extends Controller
     private function productSyncWorkers(): int
     {
         return max(1, min(
-            50,
+            200,
             (int) config('services.mobilesentrix_scraper.product_sync_workers', self::DEFAULT_PRODUCT_SYNC_WORKERS)
         ));
     }
@@ -370,6 +391,7 @@ class MobilesentrixController extends Controller
                     break;
                 }
 
+                $productScraperUrl = $this->scraperUrl('getProduct', $category->id);
                 $stats['categories_processed']++;
                 $this->updateProductScrapingLog($scrapingLog, $stats);
 
@@ -696,6 +718,7 @@ class MobilesentrixController extends Controller
                 'success' => $successful,
                 'message' => 'MobileSentrix product sync workers completed.',
                 'worker_count' => $workerCount,
+                'scraper_count' => count($this->scraperBaseUrls()),
                 'workers' => $workers,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
