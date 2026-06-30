@@ -35,7 +35,7 @@ class MobilesentrixController extends Controller
     private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
     private const CATEGORY_SCRAPER_URL = 'https://node-scraper.asa2020.com/getCategory';
     private const PRODUCT_SCRAPER_URL = 'https://node-scraper.asa2020.com/getProduct';
-    private const PRODUCT_SYNC_WORKERS = 5;
+    private const PRODUCT_SYNC_WORKERS = 25;
     private const PRODUCT_SYNC_CATEGORY_DELAY_SECONDS = 0;
     private const PRODUCT_SYNC_MAX_ROUNDS = 0;
 
@@ -108,9 +108,11 @@ class MobilesentrixController extends Controller
             return $remainingMinutes.' minutes';
         };
 
-        $lastRunText = $latestLog?->end_time
-            ? $formatDuration($latestLog->end_time->diffInMinutes(now()))
-            : 'No runs yet';
+        $lastRunText = $latestProcessingLog?->start_time
+            ? 'Running for '.$formatDuration($latestProcessingLog->start_time->diffInMinutes(now()))
+            : ($latestLog?->end_time
+                ? $formatDuration($latestLog->end_time->diffInMinutes(now()))
+                : 'No runs yet');
         $nextRunText = 'Ready';
 
         if ($latestLog?->start_time) {
@@ -894,17 +896,7 @@ class MobilesentrixController extends Controller
                     'message' => $nodeResponse->body(),
                 ];
 
-                $failureUpdate = ['updated_at' => now()];
-
-                if (Schema::hasColumn('ms_categories', 'process_end_date')) {
-                    $failureUpdate['process_end_date'] = now();
-                }
-
-                if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
-                    $failureUpdate['sync_minutes'] = round(abs($categoryProcessStartedAt->diffInSeconds(now())) / 60, 2);
-                }
-
-                $category->update($failureUpdate);
+                $category->touch();
 
                 return;
             }
@@ -1200,17 +1192,7 @@ class MobilesentrixController extends Controller
                 'message' => $exception->getMessage(),
             ];
 
-            $failureUpdate = ['updated_at' => now()];
-
-            if (Schema::hasColumn('ms_categories', 'process_end_date')) {
-                $failureUpdate['process_end_date'] = now();
-            }
-
-            if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
-                $failureUpdate['sync_minutes'] = round(abs($categoryProcessStartedAt->diffInSeconds(now())) / 60, 2);
-            }
-
-            $category->update($failureUpdate);
+            $category->touch();
         }
     }
 }
