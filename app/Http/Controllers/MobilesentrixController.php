@@ -924,6 +924,39 @@ class MobilesentrixController extends Controller
                 return;
             }
 
+            if (count($products) === 0) {
+                MSSyncLog::updateOrCreate(
+                    ['status' => self::SYNC_LOG_STATUS_COMPLETED, 'link' => $category->url],
+                    [
+                        'category_name' => $category->name,
+                        'message' => data_get($payload, 'message', 'No products found for this category. Category marked completed.'),
+                        'updated_at' => now(),
+                    ]
+                );
+
+                $categoryUpdate = [
+                    $statusColumn => self::CATEGORY_STATUS_COMPLETED,
+                    'product_count' => 0,
+                    'updated_at' => now(),
+                ];
+
+                if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
+                    $categoryUpdate['is_sync'] = self::CATEGORY_STATUS_COMPLETED;
+                }
+
+                if (Schema::hasColumn('ms_categories', 'process_end_date')) {
+                    $categoryUpdate['process_end_date'] = now();
+                }
+
+                if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
+                    $categoryUpdate['sync_minutes'] = round(abs($categoryProcessStartedAt->diffInSeconds(now())) / 60, 2);
+                }
+
+                $category->update($categoryUpdate);
+
+                return;
+            }
+
             $savedCount = 0;
 
             foreach ($products as $product) {
@@ -1036,7 +1069,7 @@ class MobilesentrixController extends Controller
             ];
 
             if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
-                $categoryUpdate['is_sync'] = 1;
+                $categoryUpdate['is_sync'] = self::CATEGORY_STATUS_COMPLETED;
             }
 
             if (Schema::hasColumn('ms_categories', 'process_end_date')) {
