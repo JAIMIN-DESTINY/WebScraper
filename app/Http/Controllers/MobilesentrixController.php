@@ -35,7 +35,7 @@ class MobilesentrixController extends Controller
     private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
     private const CATEGORY_SCRAPER_URL = 'http://127.0.0.1:3005/getCategory';
     private const PRODUCT_SCRAPER_URL = 'http://127.0.0.1:3005/getProduct';
-    private const PRODUCT_SYNC_WORKERS = 100;
+    private const PRODUCT_SYNC_WORKERS = 5;
     private const PRODUCT_SYNC_CATEGORY_DELAY_SECONDS = 0;
     private const PRODUCT_SYNC_MAX_ROUNDS = 0;
 
@@ -43,13 +43,13 @@ class MobilesentrixController extends Controller
     {
         $activeTable = $request->query('table', 'products');
 
-        if (! in_array($activeTable, ['products', 'price', 'description'], true)) {
+        if (!in_array($activeTable, ['products', 'price', 'description'], true)) {
             $activeTable = 'products';
         }
 
         $perPage = (int) $request->query('per_page', 10);
 
-        if (! in_array($perPage, [10, 25, 50], true)) {
+        if (!in_array($perPage, [10, 25, 50], true)) {
             $perPage = 10;
         }
 
@@ -98,18 +98,18 @@ class MobilesentrixController extends Controller
                 $days = intdiv($hours, 24);
                 $remainingHours = $hours % 24;
 
-                return trim($days.' days '.$remainingHours.' hours '.$remainingMinutes.' minutes');
+                return trim($days . ' days ' . $remainingHours . ' hours ' . $remainingMinutes . ' minutes');
             }
 
             if ($hours > 0) {
-                return trim($hours.' hours '.$remainingMinutes.' minutes');
+                return trim($hours . ' hours ' . $remainingMinutes . ' minutes');
             }
 
-            return $remainingMinutes.' minutes';
+            return $remainingMinutes . ' minutes';
         };
 
         $lastRunText = $latestProcessingLog?->start_time
-            ? 'Running for '.$formatDuration($latestProcessingLog->start_time->diffInMinutes(now()))
+            ? 'Running for ' . $formatDuration($latestProcessingLog->start_time->diffInMinutes(now()))
             : ($latestLog?->end_time
                 ? $formatDuration($latestLog->end_time->diffInMinutes(now()))
                 : 'No runs yet');
@@ -118,7 +118,7 @@ class MobilesentrixController extends Controller
         if ($latestLog?->start_time) {
             $nextRunAt = $latestLog->start_time->copy()->addDays(self::DASHBOARD_SYNC_INTERVAL_DAYS);
             $nextRunText = $nextRunAt->isFuture()
-                ? 'In ~'.$formatDuration(now()->diffInMinutes($nextRunAt))
+                ? 'In ~' . $formatDuration(now()->diffInMinutes($nextRunAt))
                 : 'Ready';
         }
 
@@ -131,7 +131,7 @@ class MobilesentrixController extends Controller
                         ->latest()
                         ->limit(50)
                         ->get()
-                        ->map(fn (MSPriceCompare $change): array => [
+                        ->map(fn(MSPriceCompare $change): array => [
                             'Product' => $change->product_name ?: 'Unknown product',
                             'SKU' => $change->sku ?: '-',
                             'Type' => 'Price',
@@ -150,7 +150,7 @@ class MobilesentrixController extends Controller
                         ->latest()
                         ->limit(50)
                         ->get()
-                        ->map(fn (MSDescriptionCompare $change): array => [
+                        ->map(fn(MSDescriptionCompare $change): array => [
                             'Product' => $change->product_name ?: 'Unknown product',
                             'SKU' => $change->sku ?: '-',
                             'Type' => 'Description',
@@ -161,31 +161,31 @@ class MobilesentrixController extends Controller
                 'paginator' => null,
                 'empty' => 'No description updates found.',
             ],
-            default => (function () use ($hasProductsTable, $hasCategoriesTable, $perPage): array {
-                if (! $hasProductsTable) {
-                    return [
+            default => (function () use ($hasProductsTable, $hasCategoriesTable, $perPage): array{
+                    if (!$hasProductsTable) {
+                        return [
                         'title' => 'All Products',
                         'columns' => ['Product', 'SKU', 'Category', 'Price', 'Updated', 'URL'],
                         'rows' => collect(),
                         'paginator' => null,
                         'empty' => 'No products found.',
-                    ];
-                }
+                        ];
+                    }
 
-                $productsQuery = MSProduct::query()->latest();
+                    $productsQuery = MSProduct::query()->latest();
 
-                if ($hasCategoriesTable) {
-                    $productsQuery->with('category:id,name');
-                }
+                    if ($hasCategoriesTable) {
+                        $productsQuery->with('category:id,name');
+                    }
 
-                $products = $productsQuery->paginate($perPage)->withQueryString();
+                    $products = $productsQuery->paginate($perPage)->withQueryString();
 
-                return [
+                    return [
                     'title' => 'All Products',
                     'columns' => ['Product', 'SKU', 'Category', 'Price', 'Updated', 'URL'],
                     'rows' => $products
                         ->getCollection()
-                        ->map(fn (MSProduct $product): array => [
+                        ->map(fn(MSProduct $product): array => [
                             'Product' => $product->name ?: 'Unknown product',
                             'SKU' => $product->sku ?: '-',
                             'Category' => $product->relationLoaded('category') ? ($product->category?->name ?: '-') : '-',
@@ -195,8 +195,8 @@ class MobilesentrixController extends Controller
                         ]),
                     'paginator' => $products,
                     'empty' => 'No products found.',
-                ];
-            })(),
+                    ];
+                })(),
         };
 
         return view('ms-dashboard', [
@@ -221,7 +221,7 @@ class MobilesentrixController extends Controller
 
     public function ExportAllProducts(): StreamedResponse
     {
-        $fileName = 'ms-products-'.now()->format('Y-m-d-His').'.csv';
+        $fileName = 'ms-products-' . now()->format('Y-m-d-His') . '.csv';
 
         return response()->streamDownload(function (): void {
             $handle = fopen('php://output', 'w');
@@ -239,7 +239,7 @@ class MobilesentrixController extends Controller
                 'Updated At',
             ]);
 
-            if (! Schema::hasTable('ms_product')) {
+            if (!Schema::hasTable('ms_product')) {
                 fclose($handle);
 
                 return;
@@ -302,7 +302,7 @@ class MobilesentrixController extends Controller
             $payload = $nodeResponse->json();
             $groups = data_get($payload, 'data', []);
 
-            if (! is_array($groups)) {
+            if (!is_array($groups)) {
                 MSSyncLog::updateOrCreate(
                     ['status' => self::SYNC_LOG_STATUS_CATEGORY, 'link' => self::SYNC_LOG_LINK_CATEGORY_RUN],
                     [
@@ -326,7 +326,7 @@ class MobilesentrixController extends Controller
                 $mainCategory = trim(preg_replace('/\s+/', ' ', (string) data_get($group, 'mainCategory')) ?? '');
                 $categories = data_get($group, 'categories', []);
 
-                if (! is_array($categories)) {
+                if (!is_array($categories)) {
                     continue;
                 }
 
@@ -361,7 +361,7 @@ class MobilesentrixController extends Controller
                     ['status' => self::SYNC_LOG_STATUS_COMPLETED, 'link' => self::SYNC_LOG_LINK_CATEGORY_RUN],
                     [
                         'category_name' => 'MobileSentrix Categories',
-                        'message' => 'MobileSentrix categories synced successfully. Category count: '.count($rows).'.',
+                        'message' => 'MobileSentrix categories synced successfully. Category count: ' . count($rows) . '.',
                         'updated_at' => now(),
                     ]
                 );
@@ -561,7 +561,7 @@ class MobilesentrixController extends Controller
                     ['status' => self::SYNC_LOG_STATUS_COMPLETED, 'link' => self::SYNC_LOG_LINK_PRODUCT_RUN],
                     [
                         'category_name' => 'MobileSentrix Products',
-                        'message' => 'MobileSentrix product sync '.($scrapingLog->status === self::SCRAPING_LOG_STATUS_COMPLETED ? 'completed' : 'completed with issues').'. Products: '.$scrapingLog->product_count.', categories processed: '.$scrapingLog->processing.'/'.$scrapingLog->category_count.'.',
+                        'message' => 'MobileSentrix product sync ' . ($scrapingLog->status === self::SCRAPING_LOG_STATUS_COMPLETED ? 'completed' : 'completed with issues') . '. Products: ' . $scrapingLog->product_count . ', categories processed: ' . $scrapingLog->processing . '/' . $scrapingLog->category_count . '.',
                         'updated_at' => now(),
                     ]
                 );
@@ -606,7 +606,7 @@ class MobilesentrixController extends Controller
 
     public function MsProduct(Request $request): JsonResponse
     {
-        $syncUrl = $request->getSchemeAndHttpHost().route('ms-product-sync', [], false);
+        $syncUrl = $request->getSchemeAndHttpHost() . route('ms-product-sync', [], false);
 
         try {
             if (function_exists('set_time_limit')) {
@@ -709,7 +709,7 @@ class MobilesentrixController extends Controller
                             ->get(['id', 'status', 'link']);
 
                         foreach ($logs as $log) {
-                            $key = $log->status.'|'.($log->link ?? '');
+                            $key = $log->status . '|' . ($log->link ?? '');
 
                             if (isset($seen[$key])) {
                                 DB::table('ms_sync_logs')->where('id', $log->id)->delete();
@@ -775,7 +775,7 @@ class MobilesentrixController extends Controller
                 $round++;
                 $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
                     for ($worker = 1; $worker <= $workerCount; $worker++) {
-                        $pool->as('worker_'.$worker)->timeout(1500)->get($syncUrl);
+                        $pool->as('worker_' . $worker)->timeout(1500)->get($syncUrl);
                     }
                 });
                 $workers = [];
@@ -792,7 +792,7 @@ class MobilesentrixController extends Controller
 
                     $responseData = $workerResponse->json();
 
-                    if (! is_array($responseData)) {
+                    if (!is_array($responseData)) {
                         $responseData = ['body' => $workerResponse->body()];
                     }
 
@@ -819,7 +819,7 @@ class MobilesentrixController extends Controller
                     'round' => $round,
                     'pending_before' => $pendingBefore,
                     'pending_after' => $pendingCategories,
-                    'worker_success' => collect($workers)->every(fn (array $worker): bool => $worker['success']),
+                    'worker_success' => collect($workers)->every(fn(array $worker): bool => $worker['success']),
                 ];
 
                 if ($pendingCategories === 0) {
@@ -904,7 +904,7 @@ class MobilesentrixController extends Controller
             $payload = $nodeResponse->json();
             $products = data_get($payload, 'data', []);
 
-            if (! is_array($products)) {
+            if (!is_array($products)) {
                 MSSyncLog::updateOrCreate(
                     ['status' => self::SYNC_LOG_STATUS_PRODUCT, 'link' => $category->url],
                     [
@@ -964,7 +964,7 @@ class MobilesentrixController extends Controller
                 }
 
                 $msProduct ??= new MSProduct;
-                $isNew = ! $msProduct->exists;
+                $isNew = !$msProduct->exists;
 
                 $msProduct->fill([
                     'ms_category_id' => $category->id,
@@ -982,7 +982,7 @@ class MobilesentrixController extends Controller
                     $sqlState = (string) ($exception->errorInfo[0] ?? '');
                     $driverCode = (string) ($exception->errorInfo[1] ?? '');
 
-                    if ($sqlState !== '23000' && ! in_array($driverCode, ['1062', '19'], true)) {
+                    if ($sqlState !== '23000' && !in_array($driverCode, ['1062', '19'], true)) {
                         throw $exception;
                     }
 
@@ -1074,8 +1074,8 @@ class MobilesentrixController extends Controller
 
                 return number_format((float) $value, 4, '.', '');
             };
-            $normalizeText = static fn ($text): string => trim(preg_replace('/\s+/', ' ', (string) $text) ?? '');
-            $normalizeName = static fn ($name): string => strtolower($normalizeText($name));
+            $normalizeText = static fn($text): string => trim(preg_replace('/\s+/', ' ', (string) $text) ?? '');
+            $normalizeName = static fn($name): string => strtolower($normalizeText($name));
             $oldBySku = [];
             $oldByUrl = [];
             $oldByName = [];
@@ -1142,7 +1142,7 @@ class MobilesentrixController extends Controller
                     $descriptionDuplicateQuery->where('product_name', $newProduct->name);
                 }
 
-                if ($oldPrice !== $newPrice && ! $priceDuplicateQuery->exists()) {
+                if ($oldPrice !== $newPrice && !$priceDuplicateQuery->exists()) {
                     MSPriceCompare::create([
                         'ms_category_id' => $category->id,
                         'product_name' => $newProduct->name,
@@ -1157,7 +1157,7 @@ class MobilesentrixController extends Controller
                     $priceChanges++;
                 }
 
-                if ($oldDescription !== $newDescription && ! $descriptionDuplicateQuery->exists()) {
+                if ($oldDescription !== $newDescription && !$descriptionDuplicateQuery->exists()) {
                     MSDescriptionCompare::create([
                         'ms_category_id' => $category->id,
                         'product_name' => $newProduct->name,
