@@ -16,6 +16,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Carbon;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use Throwable;
 
@@ -30,14 +31,16 @@ class MobilesentrixController extends Controller
     private const SCRAPING_LOG_STATUS_PROCESSING = 0;
     private const SCRAPING_LOG_STATUS_COMPLETED = 1;
     private const SCRAPING_LOG_STATUS_ISSUE = 2;
-    private const DASHBOARD_SYNC_INTERVAL_DAYS = 7;
+    private const PRODUCT_SYNC_INTERVAL_DAYS = 7;
     private const SYNC_LOG_LINK_CATEGORY_RUN = 'ms-category';
     private const SYNC_LOG_LINK_PRODUCT_RUN = 'ms-product';
-    private const CATEGORY_SCRAPER_URL = 'http://127.0.0.1:3005/getCategory';
-    private const PRODUCT_SCRAPER_URL = 'http://127.0.0.1:3005/getProduct';
+    private const CATEGORY_SCRAPER_URL = 'https://node-scraper.asa2020.com/getCategory';
+    private const PRODUCT_SCRAPER_URL = 'https://node-scraper.asa2020.com/getProduct';
     private const PRODUCT_SYNC_WORKERS = 5;
     private const PRODUCT_SYNC_CATEGORY_DELAY_SECONDS = 0;
     private const PRODUCT_SYNC_MAX_ROUNDS = 0;
+
+
 
     public function Dashboard(Request $request)
     {
@@ -116,7 +119,7 @@ class MobilesentrixController extends Controller
         $nextRunText = 'Ready';
 
         if ($latestLog?->start_time) {
-            $nextRunAt = $latestLog->start_time->copy()->addDays(self::DASHBOARD_SYNC_INTERVAL_DAYS);
+            $nextRunAt = $latestLog->start_time->copy()->addDays(self::PRODUCT_SYNC_INTERVAL_DAYS);
             $nextRunText = $nextRunAt->isFuture()
                 ? 'In ~' . $formatDuration(now()->diffInMinutes($nextRunAt))
                 : 'Ready';
@@ -218,6 +221,7 @@ class MobilesentrixController extends Controller
             'dashboardTable' => $dashboardTable,
         ]);
     }
+
 
     public function ExportAllProducts(): StreamedResponse
     {
@@ -390,6 +394,264 @@ class MobilesentrixController extends Controller
         }
     }
 
+
+    public function MsProduct(Request $request): JsonResponse
+    {
+        $syncUrl = $request->getSchemeAndHttpHost() . route('ms-product-sync', [], false);
+
+        try {
+            if (function_exists('set_time_limit')) {
+                set_time_limit(0);
+            }
+
+            $today = today()->toDateString();
+            $now = now();
+            $lastSyncDate = DB::table('ms_sync_settings')->where('id', 1)->value('last_product_sync_date');
+
+            if ($lastSyncDate === null) {
+                $lastProductUpdatedAt = MSProduct::query()->max('updated_at') ?: MSProduct::query()->max('created_at');
+
+                if ($lastProductUpdatedAt !== null) {
+                    $lastSyncDate = substr((string) $lastProductUpdatedAt, 0, 10);
+                }
+            }
+
+            $lastSyncDay = $lastSyncDate === null ? null : Carbon::parse($lastSyncDate)->startOfDay();
+            $shouldStartNewSync = $lastSyncDay === null
+                || $lastSyncDay->copy()->addDays(self::PRODUCT_SYNC_INTERVAL_DAYS)->lte(today());
+
+            if ($shouldStartNewSync) {
+                DB::transaction(function () use ($today, $now): void {
+                    $sourceCount = DB::table('ms_product')->count();
+                    $oldCountBefore = DB::table('ms_old_product')->count();
+
+                    if ($sourceCount > 0) {
+                        DB::table('ms_old_product')->insertUsing(
+                            [
+                                'old_product_id',
+                                'ms_category_id',
+                                'name',
+                                'price',
+                                'img',
+                                'product_url',
+                                'sku',
+                                'description',
+                                'created_at',
+                                'updated_at',
+                                'snapshot_date',
+                            ],
+                            DB::table('ms_product')
+                                ->select([
+                                    'id as old_product_id',
+                                    'ms_category_id',
+                                    'name',
+                                    'price',
+                                    'img',
+                                    'product_url',
+                                    'sku',
+                                    'description',
+                                    'created_at',
+                                    'updated_at',
+                                ])
+                                ->selectRaw('? as snapshot_date', [$today])
+                        );
+
+                        $oldCountAfter = DB::table('ms_old_product')->count();
+
+                        if (($oldCountAfter - $oldCountBefore) !== $sourceCount) {
+                            throw new \RuntimeException('Old product snapshot count does not match current product count.');
+                        }
+                    }
+
+                    DB::table('ms_product')->delete();
+
+                    $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
+                    $categoryReset = [
+                        $statusColumn => self::CATEGORY_STATUS_PENDING,
+                        'product_count' => 0,
+                        'updated_at' => $now,
+                    ];
+
+                    if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
+                        $categoryReset['is_sync'] = 0;
+                    }
+
+                    if (Schema::hasColumn('ms_categories', 'process_start_date')) {
+                        $categoryReset['process_start_date'] = null;
+                    }
+
+                    if (Schema::hasColumn('ms_categories', 'process_end_date')) {
+                        $categoryReset['process_end_date'] = null;
+                    }
+
+                    if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
+                        $categoryReset['sync_minutes'] = null;
+                    }
+
+                    DB::table('ms_categories')->update($categoryReset);
+
+                    if (Schema::hasTable('ms_sync_logs')) {
+                        DB::table('ms_sync_logs')
+                            ->where('status', self::SYNC_LOG_STATUS_COMPLETED)
+                            ->whereNotIn('link', [self::SYNC_LOG_LINK_CATEGORY_RUN, self::SYNC_LOG_LINK_PRODUCT_RUN])
+                            ->delete();
+                        DB::table('ms_sync_logs')->where('updated_at', '<', now()->subDays(14))->delete();
+
+                        $seen = [];
+                        $logs = DB::table('ms_sync_logs')
+                            ->orderByDesc('updated_at')
+                            ->orderByDesc('id')
+                            ->get(['id', 'status', 'link']);
+
+                        foreach ($logs as $log) {
+                            $key = $log->status . '|' . ($log->link ?? '');
+
+                            if (isset($seen[$key])) {
+                                DB::table('ms_sync_logs')->where('id', $log->id)->delete();
+                                continue;
+                            }
+
+                            $seen[$key] = true;
+                        }
+                    }
+
+                    DB::table('ms_sync_settings')->updateOrInsert(
+                        ['id' => 1],
+                        [
+                            'last_product_sync_date' => $today,
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ]
+                    );
+                });
+            } else {
+                DB::table('ms_sync_settings')->updateOrInsert(
+                    ['id' => 1],
+                    [
+                        'last_product_sync_date' => $lastSyncDate,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]
+                );
+            }
+
+            $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
+            $workerCount = self::PRODUCT_SYNC_WORKERS;
+            $maxRounds = self::PRODUCT_SYNC_MAX_ROUNDS;
+            $rounds = [];
+            $workers = [];
+            $pendingCategories = 0;
+            $round = 0;
+
+            while (true) {
+                MSCategory::query()
+                    ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
+                    ->update([
+                        $statusColumn => self::CATEGORY_STATUS_PENDING,
+                        'updated_at' => now(),
+                    ]);
+
+                $pendingBefore = MSCategory::query()
+                    ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+                    ->whereNotNull('url')
+                    ->where('url', '<>', '')
+                    ->count();
+
+                if ($pendingBefore === 0) {
+                    $pendingCategories = 0;
+                    break;
+                }
+
+                if ($maxRounds > 0 && $round >= $maxRounds) {
+                    $pendingCategories = $pendingBefore;
+                    break;
+                }
+
+                $round++;
+                $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
+                    for ($worker = 1; $worker <= $workerCount; $worker++) {
+                        $pool->as('worker_' . $worker)->timeout(1500)->get($syncUrl);
+                    }
+                });
+                $workers = [];
+
+                foreach ($workerResponses as $workerName => $workerResponse) {
+                    if ($workerResponse instanceof Throwable) {
+                        $workers[$workerName] = [
+                            'success' => false,
+                            'status' => 0,
+                            'data' => ['message' => $workerResponse->getMessage()],
+                        ];
+                        continue;
+                    }
+
+                    $responseData = $workerResponse->json();
+
+                    if (!is_array($responseData)) {
+                        $responseData = ['body' => $workerResponse->body()];
+                    }
+
+                    $workers[$workerName] = [
+                        'success' => $workerResponse->successful(),
+                        'status' => $workerResponse->status(),
+                        'data' => $responseData,
+                    ];
+                }
+
+                MSCategory::query()
+                    ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
+                    ->update([
+                        $statusColumn => self::CATEGORY_STATUS_PENDING,
+                        'updated_at' => now(),
+                    ]);
+
+                $pendingCategories = MSCategory::query()
+                    ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
+                    ->whereNotNull('url')
+                    ->where('url', '<>', '')
+                    ->count();
+                $rounds[] = [
+                    'round' => $round,
+                    'pending_before' => $pendingBefore,
+                    'pending_after' => $pendingCategories,
+                    'worker_success' => collect($workers)->every(fn(array $worker): bool => $worker['success']),
+                ];
+
+                if ($pendingCategories === 0) {
+                    break;
+                }
+            }
+
+            $successful = $pendingCategories === 0;
+
+            return response()->json([
+                'success' => $successful,
+                'message' => $successful
+                    ? 'MobileSentrix product sync workers completed.'
+                    : 'MobileSentrix product sync stopped before all categories completed.',
+                'worker_count' => $workerCount,
+                'round_count' => $round,
+                'pending_categories' => $pendingCategories,
+                'rounds' => $rounds,
+                'workers' => $workers,
+            ], $successful ? 200 : 500);
+        } catch (Throwable $exception) {
+            MSSyncLog::updateOrCreate(
+                ['status' => self::SYNC_LOG_STATUS_PRODUCT, 'link' => self::SYNC_LOG_LINK_PRODUCT_RUN],
+                [
+                    'category_name' => 'MobileSentrix Products',
+                    'message' => str($exception->getMessage())->limit(2000)->toString(),
+                    'updated_at' => now(),
+                ]
+            );
+
+            return response()->json([
+                'success' => false,
+                'message' => $exception->getMessage(),
+            ], 500);
+        }
+    }
+
     public function MsProductSync(): JsonResponse
     {
         $productScraperUrl = self::PRODUCT_SCRAPER_URL;
@@ -410,12 +672,13 @@ class MobilesentrixController extends Controller
             $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
             $categoryQuery = MSCategory::query()->whereNotNull('url')->where('url', '<>', '');
             $categoryCount = (clone $categoryQuery)->where($statusColumn, self::CATEGORY_STATUS_PENDING)->count();
-            $today = today()->toDateString();
+            $syncDate = $this->productSyncSnapshotDate();
+            $syncDay = Carbon::parse($syncDate)->startOfDay();
             $now = now();
 
             if (Schema::hasColumn('ms_scraping_log', 'log_date')) {
                 DB::table('ms_scraping_log')->insertOrIgnore([
-                    'log_date' => $today,
+                    'log_date' => $syncDate,
                     'start_time' => $startedAt,
                     'product_count' => 0,
                     'category_count' => $categoryCount,
@@ -426,7 +689,7 @@ class MobilesentrixController extends Controller
                 ]);
 
                 DB::table('ms_scraping_log')
-                    ->where('log_date', $today)
+                    ->where('log_date', $syncDate)
                     ->update([
                         'category_count' => $categoryCount,
                         'status' => self::SCRAPING_LOG_STATUS_PROCESSING,
@@ -434,11 +697,11 @@ class MobilesentrixController extends Controller
                         'updated_at' => $now,
                     ]);
 
-                $scrapingLog = MSScrapingLog::query()->where('log_date', $today)->firstOrFail();
+                $scrapingLog = MSScrapingLog::query()->where('log_date', $syncDate)->firstOrFail();
             } else {
                 $scrapingLog = MSScrapingLog::query()
-                    ->where('start_time', '>=', today())
-                    ->where('start_time', '<', today()->copy()->addDay())
+                    ->where('start_time', '>=', $syncDay)
+                    ->where('start_time', '<', $syncDay->copy()->addDay())
                     ->first();
 
                 if ($scrapingLog !== null) {
@@ -604,258 +867,12 @@ class MobilesentrixController extends Controller
         }
     }
 
-    public function MsProduct(Request $request): JsonResponse
+
+    private function productSyncSnapshotDate(): string
     {
-        $syncUrl = $request->getSchemeAndHttpHost() . route('ms-product-sync', [], false);
-
-        try {
-            if (function_exists('set_time_limit')) {
-                set_time_limit(0);
-            }
-
-            $today = today()->toDateString();
-            $now = now();
-            $lastSyncDate = DB::table('ms_sync_settings')->where('id', 1)->value('last_product_sync_date');
-
-            if ($lastSyncDate === null) {
-                $lastProductUpdatedAt = MSProduct::query()->max('updated_at') ?: MSProduct::query()->max('created_at');
-
-                if ($lastProductUpdatedAt !== null) {
-                    $lastSyncDate = substr((string) $lastProductUpdatedAt, 0, 10);
-                }
-            }
-
-            if ($lastSyncDate !== $today) {
-                DB::transaction(function () use ($today, $now): void {
-                    $sourceCount = DB::table('ms_product')->count();
-                    $oldCountBefore = DB::table('ms_old_product')->count();
-
-                    if ($sourceCount > 0) {
-                        DB::table('ms_old_product')->insertUsing(
-                            [
-                                'old_product_id',
-                                'ms_category_id',
-                                'name',
-                                'price',
-                                'img',
-                                'product_url',
-                                'sku',
-                                'description',
-                                'created_at',
-                                'updated_at',
-                                'snapshot_date',
-                            ],
-                            DB::table('ms_product')
-                                ->select([
-                                    'id as old_product_id',
-                                    'ms_category_id',
-                                    'name',
-                                    'price',
-                                    'img',
-                                    'product_url',
-                                    'sku',
-                                    'description',
-                                    'created_at',
-                                    'updated_at',
-                                ])
-                                ->selectRaw('? as snapshot_date', [$today])
-                        );
-
-                        $oldCountAfter = DB::table('ms_old_product')->count();
-
-                        if (($oldCountAfter - $oldCountBefore) !== $sourceCount) {
-                            throw new \RuntimeException('Old product snapshot count does not match current product count.');
-                        }
-                    }
-
-                    DB::table('ms_product')->delete();
-
-                    $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
-                    $categoryReset = [
-                        $statusColumn => self::CATEGORY_STATUS_PENDING,
-                        'product_count' => 0,
-                        'updated_at' => $now,
-                    ];
-
-                    if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
-                        $categoryReset['is_sync'] = 0;
-                    }
-
-                    if (Schema::hasColumn('ms_categories', 'process_start_date')) {
-                        $categoryReset['process_start_date'] = null;
-                    }
-
-                    if (Schema::hasColumn('ms_categories', 'process_end_date')) {
-                        $categoryReset['process_end_date'] = null;
-                    }
-
-                    if (Schema::hasColumn('ms_categories', 'sync_minutes')) {
-                        $categoryReset['sync_minutes'] = null;
-                    }
-
-                    DB::table('ms_categories')->update($categoryReset);
-
-                    if (Schema::hasTable('ms_sync_logs')) {
-                        DB::table('ms_sync_logs')
-                            ->where('status', self::SYNC_LOG_STATUS_COMPLETED)
-                            ->whereNotIn('link', [self::SYNC_LOG_LINK_CATEGORY_RUN, self::SYNC_LOG_LINK_PRODUCT_RUN])
-                            ->delete();
-                        DB::table('ms_sync_logs')->where('updated_at', '<', now()->subDays(14))->delete();
-
-                        $seen = [];
-                        $logs = DB::table('ms_sync_logs')
-                            ->orderByDesc('updated_at')
-                            ->orderByDesc('id')
-                            ->get(['id', 'status', 'link']);
-
-                        foreach ($logs as $log) {
-                            $key = $log->status . '|' . ($log->link ?? '');
-
-                            if (isset($seen[$key])) {
-                                DB::table('ms_sync_logs')->where('id', $log->id)->delete();
-                                continue;
-                            }
-
-                            $seen[$key] = true;
-                        }
-                    }
-
-                    DB::table('ms_sync_settings')->updateOrInsert(
-                        ['id' => 1],
-                        [
-                            'last_product_sync_date' => $today,
-                            'created_at' => $now,
-                            'updated_at' => $now,
-                        ]
-                    );
-                });
-            } else {
-                DB::table('ms_sync_settings')->updateOrInsert(
-                    ['id' => 1],
-                    [
-                        'last_product_sync_date' => $today,
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]
-                );
-            }
-
-            $statusColumn = Schema::hasColumn('ms_categories', 'is_status') ? 'is_status' : 'is_sync';
-            $workerCount = self::PRODUCT_SYNC_WORKERS;
-            $maxRounds = self::PRODUCT_SYNC_MAX_ROUNDS;
-            $rounds = [];
-            $workers = [];
-            $pendingCategories = 0;
-            $round = 0;
-
-            while (true) {
-                MSCategory::query()
-                    ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
-                    ->update([
-                        $statusColumn => self::CATEGORY_STATUS_PENDING,
-                        'updated_at' => now(),
-                    ]);
-
-                $pendingBefore = MSCategory::query()
-                    ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
-                    ->whereNotNull('url')
-                    ->where('url', '<>', '')
-                    ->count();
-
-                if ($pendingBefore === 0) {
-                    $pendingCategories = 0;
-                    break;
-                }
-
-                if ($maxRounds > 0 && $round >= $maxRounds) {
-                    $pendingCategories = $pendingBefore;
-                    break;
-                }
-
-                $round++;
-                $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
-                    for ($worker = 1; $worker <= $workerCount; $worker++) {
-                        $pool->as('worker_' . $worker)->timeout(1500)->get($syncUrl);
-                    }
-                });
-                $workers = [];
-
-                foreach ($workerResponses as $workerName => $workerResponse) {
-                    if ($workerResponse instanceof Throwable) {
-                        $workers[$workerName] = [
-                            'success' => false,
-                            'status' => 0,
-                            'data' => ['message' => $workerResponse->getMessage()],
-                        ];
-                        continue;
-                    }
-
-                    $responseData = $workerResponse->json();
-
-                    if (!is_array($responseData)) {
-                        $responseData = ['body' => $workerResponse->body()];
-                    }
-
-                    $workers[$workerName] = [
-                        'success' => $workerResponse->successful(),
-                        'status' => $workerResponse->status(),
-                        'data' => $responseData,
-                    ];
-                }
-
-                MSCategory::query()
-                    ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
-                    ->update([
-                        $statusColumn => self::CATEGORY_STATUS_PENDING,
-                        'updated_at' => now(),
-                    ]);
-
-                $pendingCategories = MSCategory::query()
-                    ->where($statusColumn, self::CATEGORY_STATUS_PENDING)
-                    ->whereNotNull('url')
-                    ->where('url', '<>', '')
-                    ->count();
-                $rounds[] = [
-                    'round' => $round,
-                    'pending_before' => $pendingBefore,
-                    'pending_after' => $pendingCategories,
-                    'worker_success' => collect($workers)->every(fn(array $worker): bool => $worker['success']),
-                ];
-
-                if ($pendingCategories === 0) {
-                    break;
-                }
-            }
-
-            $successful = $pendingCategories === 0;
-
-            return response()->json([
-                'success' => $successful,
-                'message' => $successful
-                    ? 'MobileSentrix product sync workers completed.'
-                    : 'MobileSentrix product sync stopped before all categories completed.',
-                'worker_count' => $workerCount,
-                'round_count' => $round,
-                'pending_categories' => $pendingCategories,
-                'rounds' => $rounds,
-                'workers' => $workers,
-            ], $successful ? 200 : 500);
-        } catch (Throwable $exception) {
-            MSSyncLog::updateOrCreate(
-                ['status' => self::SYNC_LOG_STATUS_PRODUCT, 'link' => self::SYNC_LOG_LINK_PRODUCT_RUN],
-                [
-                    'category_name' => 'MobileSentrix Products',
-                    'message' => str($exception->getMessage())->limit(2000)->toString(),
-                    'updated_at' => now(),
-                ]
-            );
-
-            return response()->json([
-                'success' => false,
-                'message' => $exception->getMessage(),
-            ], 500);
-        }
+        return (string) (DB::table('ms_sync_settings')->where('id', 1)->value('last_product_sync_date') ?: today()->toDateString());
     }
+
 
     private function syncProductCategory(MSCategory $category, string $productScraperUrl, string $statusColumn, array &$stats): void
     {
@@ -1082,7 +1099,7 @@ class MobilesentrixController extends Controller
 
             $category->update($categoryUpdate);
 
-            $compareDate = today()->toDateString();
+            $compareDate = $this->productSyncSnapshotDate();
             $oldProducts = MSOldProduct::query()
                 ->where('ms_category_id', $category->id)
                 ->where('snapshot_date', $compareDate)
