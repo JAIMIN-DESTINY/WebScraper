@@ -14,8 +14,8 @@ use Throwable;
 
 class Parts4CellsController extends Controller
 {
-    private const CATEGORY_SCRAPER_URL = 'http://localhost:3003/getCategory';
-    private const PRODUCT_SCRAPER_URL = 'http://localhost:3003/getProduct';
+    private const CATEGORY_SCRAPER_URL = 'https://node-scraper.asa2020.com/parts4cells/getCategory';
+    private const PRODUCT_SCRAPER_URL = 'https://node-scraper.asa2020.com/parts4cells/getProduct';
     private const PRODUCT_SYNC_WORKERS = 5;
     private const CATEGORY_STATUS_PENDING = 0;
     private const CATEGORY_STATUS_WORKING = 1;
