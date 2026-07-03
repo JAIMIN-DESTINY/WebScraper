@@ -243,52 +243,60 @@ class Parts4CellsController extends Controller
             }
 
             $workerCount = self::PRODUCT_SYNC_WORKERS;
-            $totalRounds = 0;
-            $allWorkerResults = [];
+            $completedCount = 0;
+            $failedCount = 0;
+            $totalSpawned = 0;
 
             while (true) {
+                // Check how many categories are currently processing or pending
                 $pendingCategories = P4cCatagory::query()
-                    ->where('is_sync', '!=', self::CATEGORY_STATUS_COMPLETED)
+                    ->where('is_sync', 0)
                     ->whereNotNull('url')
                     ->where('url', '<>', '')
                     ->count();
 
-                if ($pendingCategories === 0) {
+                $processingCategories = P4cCatagory::query()
+                    ->where('is_sync', 1)
+                    ->whereNotNull('url')
+                    ->where('url', '<>', '')
+                    ->count();
+
+                // If no pending and no processing, we're done
+                if ($pendingCategories === 0 && $processingCategories === 0) {
                     break;
                 }
 
-                $totalRounds++;
+                // Calculate how many workers to spawn
+                $availableSlots = $workerCount - $processingCategories;
+                $workersToSpawn = min($availableSlots, $pendingCategories);
 
-                $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
-                    for ($worker = 1; $worker <= $workerCount; $worker++) {
-                        $pool->as('worker_' . $worker)->timeout(1500)->get($syncUrl);
+                if ($workersToSpawn > 0) {
+                    // Spawn workers to fill available slots
+                    $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workersToSpawn): void {
+                        for ($i = 0; $i < $workersToSpawn; $i++) {
+                            $pool->as('worker_' . $i)->timeout(1500)->get($syncUrl);
+                        }
+                    });
+
+                    // Process responses
+                    foreach ($workerResponses as $workerName => $workerResponse) {
+                        $totalSpawned++;
+                        
+                        if ($workerResponse instanceof Throwable) {
+                            $failedCount++;
+                            continue;
+                        }
+
+                        if ($workerResponse->successful()) {
+                            $completedCount++;
+                        } else {
+                            $failedCount++;
+                        }
                     }
-                });
-
-                $roundWorkers = [];
-                foreach ($workerResponses as $workerName => $workerResponse) {
-                    if ($workerResponse instanceof Throwable) {
-                        $roundWorkers[$workerName] = [
-                            'success' => false,
-                            'status' => 0,
-                            'data' => ['message' => $workerResponse->getMessage()],
-                        ];
-                        continue;
-                    }
-
-                    $responseData = $workerResponse->json();
-                    if (!is_array($responseData)) {
-                        $responseData = ['body' => $workerResponse->body()];
-                    }
-
-                    $roundWorkers[$workerName] = [
-                        'success' => $workerResponse->successful(),
-                        'status' => $workerResponse->status(),
-                        'data' => $responseData,
-                    ];
+                } else {
+                    // All slots full, wait a bit before checking again
+                    sleep(2);
                 }
-
-                $allWorkerResults['round_' . $totalRounds] = $roundWorkers;
             }
 
             $finalPendingCategories = P4cCatagory::query()
@@ -316,9 +324,10 @@ class Parts4CellsController extends Controller
                 'total_categories' => $totalCategories,
                 'completed_categories' => $completedCategories,
                 'pending_categories' => $finalPendingCategories,
-                'worker_count' => $workerCount,
-                'total_rounds' => $totalRounds,
-                'worker_results' => $allWorkerResults,
+                'max_concurrent_workers' => $workerCount,
+                'total_workers_spawned' => $totalSpawned,
+                'completed_count' => $completedCount,
+                'failed_count' => $failedCount,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
             return response()->json([
