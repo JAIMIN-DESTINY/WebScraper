@@ -243,51 +243,82 @@ class Parts4CellsController extends Controller
             }
 
             $workerCount = self::PRODUCT_SYNC_WORKERS;
-            $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
-                for ($worker = 1; $worker <= $workerCount; $worker++) {
-                    $pool->as('worker_' . $worker)->timeout(1500)->get($syncUrl);
-                }
-            });
+            $totalRounds = 0;
+            $allWorkerResults = [];
 
-            $workers = [];
-            foreach ($workerResponses as $workerName => $workerResponse) {
-                if ($workerResponse instanceof Throwable) {
-                    $workers[$workerName] = [
-                        'success' => false,
-                        'status' => 0,
-                        'data' => ['message' => $workerResponse->getMessage()],
+            while (true) {
+                $pendingCategories = P4cCatagory::query()
+                    ->where('is_sync', '!=', self::CATEGORY_STATUS_COMPLETED)
+                    ->whereNotNull('url')
+                    ->where('url', '<>', '')
+                    ->count();
+
+                if ($pendingCategories === 0) {
+                    break;
+                }
+
+                $totalRounds++;
+
+                $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workerCount): void {
+                    for ($worker = 1; $worker <= $workerCount; $worker++) {
+                        $pool->as('worker_' . $worker)->timeout(1500)->get($syncUrl);
+                    }
+                });
+
+                $roundWorkers = [];
+                foreach ($workerResponses as $workerName => $workerResponse) {
+                    if ($workerResponse instanceof Throwable) {
+                        $roundWorkers[$workerName] = [
+                            'success' => false,
+                            'status' => 0,
+                            'data' => ['message' => $workerResponse->getMessage()],
+                        ];
+                        continue;
+                    }
+
+                    $responseData = $workerResponse->json();
+                    if (!is_array($responseData)) {
+                        $responseData = ['body' => $workerResponse->body()];
+                    }
+
+                    $roundWorkers[$workerName] = [
+                        'success' => $workerResponse->successful(),
+                        'status' => $workerResponse->status(),
+                        'data' => $responseData,
                     ];
-                    continue;
                 }
 
-                $responseData = $workerResponse->json();
-                if (!is_array($responseData)) {
-                    $responseData = ['body' => $workerResponse->body()];
-                }
-
-                $workers[$workerName] = [
-                    'success' => $workerResponse->successful(),
-                    'status' => $workerResponse->status(),
-                    'data' => $responseData,
-                ];
+                $allWorkerResults['round_' . $totalRounds] = $roundWorkers;
             }
 
-            $pendingCategories = P4cCatagory::query()
-                ->where('is_sync', 0)
+            $finalPendingCategories = P4cCatagory::query()
+                ->where('is_sync', '!=', self::CATEGORY_STATUS_COMPLETED)
                 ->whereNotNull('url')
                 ->where('url', '<>', '')
                 ->count();
 
-            $successful = $pendingCategories === 0;
+            $completedCategories = P4cCatagory::query()
+                ->where('is_sync', self::CATEGORY_STATUS_COMPLETED)
+                ->count();
+
+            $totalCategories = P4cCatagory::query()
+                ->whereNotNull('url')
+                ->where('url', '<>', '')
+                ->count();
+
+            $successful = $finalPendingCategories === 0;
 
             return response()->json([
                 'success' => $successful,
                 'message' => $successful
-                    ? 'Parts4Cells product sync workers completed.'
-                    : 'Parts4Cells product sync stopped before all categories completed.',
+                    ? 'All Parts4Cells categories synchronized successfully.'
+                    : 'Parts4Cells product sync completed with some pending categories.',
+                'total_categories' => $totalCategories,
+                'completed_categories' => $completedCategories,
+                'pending_categories' => $finalPendingCategories,
                 'worker_count' => $workerCount,
-                'pending_categories' => $pendingCategories,
-                'workers' => $workers,
+                'total_rounds' => $totalRounds,
+                'worker_results' => $allWorkerResults,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
             return response()->json([
