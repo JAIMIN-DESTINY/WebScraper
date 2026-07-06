@@ -25,6 +25,7 @@ class MobilesentrixController extends Controller
     private const CATEGORY_STATUS_PENDING = 0;
     private const CATEGORY_STATUS_WORKING = 1;
     private const CATEGORY_STATUS_COMPLETED = 2;
+    private const CATEGORY_STATUS_TIMEOUT = 3;
     private const SYNC_LOG_STATUS_CATEGORY = 0;
     private const SYNC_LOG_STATUS_PRODUCT = 1;
     private const SYNC_LOG_STATUS_COMPLETED = 2;
@@ -488,7 +489,10 @@ class MobilesentrixController extends Controller
                         $categoryReset['sync_minutes'] = null;
                     }
 
-                    DB::table('ms_categories')->update($categoryReset);
+                    // Reset all categories except those with timeout status (3)
+                    DB::table('ms_categories')
+                        ->where($statusColumn, '!=', self::CATEGORY_STATUS_TIMEOUT)
+                        ->update($categoryReset);
 
                     if (Schema::hasTable('ms_sync_logs')) {
                         DB::table('ms_sync_logs')
@@ -600,6 +604,7 @@ class MobilesentrixController extends Controller
 
                 MSCategory::query()
                     ->where($statusColumn, self::CATEGORY_STATUS_WORKING)
+                    ->where($statusColumn, '!=', self::CATEGORY_STATUS_TIMEOUT)
                     ->update([
                         $statusColumn => self::CATEGORY_STATUS_PENDING,
                         'updated_at' => now(),
@@ -943,22 +948,22 @@ class MobilesentrixController extends Controller
 
             if (count($products) === 0) {
                 MSSyncLog::updateOrCreate(
-                    ['status' => self::SYNC_LOG_STATUS_COMPLETED, 'link' => $category->url],
+                    ['status' => self::SYNC_LOG_STATUS_PRODUCT, 'link' => $category->url],
                     [
                         'category_name' => $category->name,
-                        'message' => data_get($payload, 'message', 'No products found for this category. Category marked completed.'),
+                        'message' => data_get($payload, 'message', 'No products found for this category. Category marked with timeout status (permanent).'),
                         'updated_at' => now(),
                     ]
                 );
 
                 $categoryUpdate = [
-                    $statusColumn => self::CATEGORY_STATUS_COMPLETED,
+                    $statusColumn => self::CATEGORY_STATUS_TIMEOUT,
                     'product_count' => 0,
                     'updated_at' => now(),
                 ];
 
                 if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
-                    $categoryUpdate['is_sync'] = self::CATEGORY_STATUS_COMPLETED;
+                    $categoryUpdate['is_sync'] = self::CATEGORY_STATUS_TIMEOUT;
                 }
 
                 if (Schema::hasColumn('ms_categories', 'process_end_date')) {
@@ -1226,11 +1231,15 @@ class MobilesentrixController extends Controller
             $stats['price_changes'] += $priceChanges;
             $stats['description_changes'] += $descriptionChanges;
         } catch (Throwable $exception) {
+            $errorMessage = $exception->getMessage();
+            $isTimeoutError = str_contains($errorMessage, 'cURL error 28') && 
+                             str_contains($errorMessage, 'Operation timed out');
+
             MSSyncLog::updateOrCreate(
                 ['status' => self::SYNC_LOG_STATUS_PRODUCT, 'link' => $category->url],
                 [
                     'category_name' => $category->name,
-                    'message' => str($exception->getMessage())->limit(2000)->toString(),
+                    'message' => str($errorMessage)->limit(2000)->toString(),
                     'updated_at' => now(),
                 ]
             );
@@ -1239,10 +1248,21 @@ class MobilesentrixController extends Controller
                 'category_id' => $category->id,
                 'url' => $category->url,
                 'status' => 500,
-                'message' => $exception->getMessage(),
+                'message' => $errorMessage,
             ];
 
-            $category->touch();
+            // If this is a timeout error, mark the category with status 3
+            if ($isTimeoutError) {
+                $timeoutUpdate = [$statusColumn => self::CATEGORY_STATUS_TIMEOUT];
+                
+                if ($statusColumn !== 'is_sync' && Schema::hasColumn('ms_categories', 'is_sync')) {
+                    $timeoutUpdate['is_sync'] = self::CATEGORY_STATUS_TIMEOUT;
+                }
+                
+                $category->update($timeoutUpdate);
+            } else {
+                $category->touch();
+            }
         }
     }
 }
