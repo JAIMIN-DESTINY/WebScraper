@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\MobilesentrixController;
 use App\Http\Controllers\Parts4CellsController;
+use App\Http\Controllers\PhoneLCDPartsController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('date-check', function () {
@@ -24,3 +25,11 @@ Route::get('p4c-product-sync', [Parts4CellsController::class, 'P4cProductSync'])
 
 Route::get('p4c-dashboard', [Parts4CellsController::class, 'Dashboard'])->name('p4c-dashboard');
 Route::get('p4c-products/export', [Parts4CellsController::class, 'ExportAllProducts'])->name('p4c-products.export');
+
+// PhoneLCDParts
+Route::get('plp-category', [PhoneLCDPartsController::class, 'PlpCategory'])->name('plp-category');
+Route::get('plp-product', [PhoneLCDPartsController::class, 'PlpProduct'])->name('plp-product');
+Route::get('plp-product-sync', [PhoneLCDPartsController::class, 'PlpProductSync'])->name('plp-product-sync');
+
+Route::get('plp-dashboard', [PhoneLCDPartsController::class, 'Dashboard'])->name('plp-dashboard');
+Route::get('plp-products/export', [PhoneLCDPartsController::class, 'ExportAllProducts'])->name('plp-products.export');
