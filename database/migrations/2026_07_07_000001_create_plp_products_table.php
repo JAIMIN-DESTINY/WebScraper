@@ -11,9 +11,9 @@ return new class extends Migration
         Schema::create('plp_products', function (Blueprint $table) {
             $table->id();
             $table->foreignId('plp_catagory_id')->nullable()->constrained('plp_categories')->onDelete('set null');
-            $table->string('name');
-            $table->string('product_url')->unique();
-            $table->string('image')->nullable();
+            $table->text('name');
+            $table->string('product_url', 768)->unique();
+            $table->text('image')->nullable();
             $table->string('price')->nullable();
             $table->string('sku')->nullable();
             $table->timestamps();
