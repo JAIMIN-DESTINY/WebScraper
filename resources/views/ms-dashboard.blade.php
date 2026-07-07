@@ -111,6 +111,40 @@
             transform: translateY(-1px);
         }
 
+        .dashboard-switcher {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 14px;
+            padding: 12px;
+            border-radius: 8px;
+        }
+
+        .dashboard-switch-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 40px;
+            padding: 0 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: #1f2937;
+            background: rgba(255, 255, 255, 0.72);
+            font-size: 14px;
+            font-weight: 800;
+            text-decoration: none;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+        }
+
+        .dashboard-switch-link:hover,
+        .dashboard-switch-link.is-active {
+            border-color: rgba(37, 99, 235, 0.48);
+            color: #ffffff;
+            background: var(--blue);
+            box-shadow: 0 10px 24px rgba(37, 99, 235, 0.16);
+            transform: translateY(-1px);
+        }
+
         .metric-label,
         .section-label,
         .status-label,
@@ -431,6 +465,8 @@
             <h1>TxParts Scraping Dashboard For Mobile Sentrix</h1>
             <a class="export-btn" href="{{ route('ms-products.export') }}">Export All Products</a>
         </header>
+
+        @include('partials.dashboard-switcher', ['activeDashboard' => 'ms'])
 
         <section class="metrics" aria-label="Scraping metrics">
             <a class="metric-card {{ $activeTable === 'products' ? 'is-active' : '' }}" href="{{ route('ms-dashboard', ['table' => 'products']) }}">
