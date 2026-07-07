@@ -235,69 +235,58 @@ class Parts4CellsController extends Controller
 
     public function P4cProduct(): JsonResponse
     {
-        $syncUrl = request()->getSchemeAndHttpHost() . route('p4c-product-sync', [], false);
-
         try {
             if (function_exists('set_time_limit')) {
                 set_time_limit(0);
             }
 
+            $recoveredCount = $this->releaseInterruptedP4cCategories();
             $workerCount = self::PRODUCT_SYNC_WORKERS;
             $completedCount = 0;
             $failedCount = 0;
             $totalSpawned = 0;
+            $attemptedCategoryIds = [];
 
-            while (true) {
-                // Check how many categories are currently processing or pending
-                $pendingCategories = P4cCatagory::query()
-                    ->where('is_sync', 0)
-                    ->whereNotNull('url')
-                    ->where('url', '<>', '')
-                    ->count();
+            do {
+                $categories = [];
 
-                $processingCategories = P4cCatagory::query()
-                    ->where('is_sync', 1)
-                    ->whereNotNull('url')
-                    ->where('url', '<>', '')
-                    ->count();
+                for ($i = 0; $i < $workerCount; $i++) {
+                    $category = $this->claimNextPendingP4cCategory($attemptedCategoryIds);
 
-                // If no pending and no processing, we're done
-                if ($pendingCategories === 0 && $processingCategories === 0) {
+                    if ($category === null) {
+                        break;
+                    }
+
+                    $categories[] = $category;
+                    $attemptedCategoryIds[] = $category->id;
+                }
+
+                if ($categories === []) {
                     break;
                 }
 
-                // Calculate how many workers to spawn
-                $availableSlots = $workerCount - $processingCategories;
-                $workersToSpawn = min($availableSlots, $pendingCategories);
-
-                if ($workersToSpawn > 0) {
-                    // Spawn workers to fill available slots
-                    $workerResponses = Http::pool(function (Pool $pool) use ($syncUrl, $workersToSpawn): void {
-                        for ($i = 0; $i < $workersToSpawn; $i++) {
-                            $pool->as('worker_' . $i)->timeout(1500)->get($syncUrl);
-                        }
-                    });
-
-                    // Process responses
-                    foreach ($workerResponses as $workerName => $workerResponse) {
-                        $totalSpawned++;
-                        
-                        if ($workerResponse instanceof Throwable) {
-                            $failedCount++;
-                            continue;
-                        }
-
-                        if ($workerResponse->successful()) {
-                            $completedCount++;
-                        } else {
-                            $failedCount++;
-                        }
+                $workerResponses = Http::pool(function (Pool $pool) use ($categories): void {
+                    foreach ($categories as $category) {
+                        $pool->as((string) $category->id)->timeout(1200)->get(self::PRODUCT_SCRAPER_URL, [
+                            'url' => $category->url,
+                        ]);
                     }
-                } else {
-                    // All slots full, wait a bit before checking again
-                    sleep(2);
+                });
+
+                foreach ($categories as $category) {
+                    $totalSpawned++;
+                    $result = $this->handleP4cProductScraperResponse(
+                        $category,
+                        $workerResponses[(string) $category->id] ?? null
+                    );
+
+                    if ($result['success']) {
+                        $completedCount++;
+                    } else {
+                        $failedCount++;
+                    }
                 }
-            }
+            } while (true);
 
             $finalPendingCategories = P4cCatagory::query()
                 ->where('is_sync', '!=', self::CATEGORY_STATUS_COMPLETED)
@@ -328,6 +317,7 @@ class Parts4CellsController extends Controller
                 'total_workers_spawned' => $totalSpawned,
                 'completed_count' => $completedCount,
                 'failed_count' => $failedCount,
+                'recovered_processing_categories' => $recoveredCount,
             ], $successful ? 200 : 500);
         } catch (Throwable $exception) {
             return response()->json([
@@ -340,34 +330,7 @@ class Parts4CellsController extends Controller
     public function P4cProductSync(): JsonResponse
     {
         try {
-            $category = null;
-
-            while (true) {
-                $candidate = P4cCatagory::query()
-                    ->where('is_sync', 0)
-                    ->whereNotNull('url')
-                    ->where('url', '<>', '')
-                    ->orderBy('id')
-                    ->first();
-
-                if ($candidate === null) {
-                    break;
-                }
-
-                $updated = P4cCatagory::query()
-                    ->where('id', $candidate->id)
-                    ->where('is_sync', 0)
-                    ->update([
-                        'is_sync' => 1,
-                        'process_start_date' => now(),
-                        'updated_at' => now(),
-                    ]);
-
-                if ($updated > 0) {
-                    $category = $candidate->fresh();
-                    break;
-                }
-            }
+            $category = $this->claimNextPendingP4cCategory();
 
             if ($category === null) {
                 return response()->json([
@@ -381,101 +344,12 @@ class Parts4CellsController extends Controller
             $nodeResponse = Http::timeout(1200)->get(self::PRODUCT_SCRAPER_URL, [
                 'url' => $category->url,
             ]);
+            $result = $this->handleP4cProductScraperResponse($category, $nodeResponse);
 
-            if ($nodeResponse->failed()) {
-                $category->update([
-                    'is_sync' => 0,
-                    'process_start_date' => null,
-                    'updated_at' => now(),
-                ]);
-
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Product scraper request failed for category: ' . $category->name,
-                    'category' => $category->name,
-                    'category_url' => $category->url,
-                    'status' => $nodeResponse->status(),
-                    'body' => $nodeResponse->body(),
-                ], $nodeResponse->status());
-            }
-
-            $payload = $nodeResponse->json();
-            $products = $payload['products'] ?? [];
-
-            if (!is_array($products)) {
-                $category->update([
-                    'is_sync' => 0,
-                    'process_start_date' => null,
-                    'updated_at' => now(),
-                ]);
-
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Invalid product scraper response.',
-                    'category' => $category->name,
-                    'response' => $payload,
-                ], 422);
-            }
-
-            $now = now();
-            $rowsByUrl = [];
-
-            foreach ($products as $product) {
-                $name = trim((string) ($product['name'] ?? ''));
-                $productUrl = trim((string) ($product['product_url'] ?? ''));
-                $image = trim((string) ($product['image'] ?? ''));
-                $price = trim((string) ($product['price'] ?? ''));
-                $sku = trim((string) ($product['sku'] ?? ''));
-
-                if ($name === '' || $productUrl === '') {
-                    continue;
-                }
-
-                $rowsByUrl[$productUrl] = [
-                    'p4c_catagory_id' => $category->id,
-                    'name' => $name,
-                    'product_url' => $productUrl,
-                    'image' => $image !== '' ? $image : null,
-                    'price' => $price !== '' ? $price : null,
-                    'sku' => $sku !== '' ? $sku : null,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ];
-            }
-
-            $rows = array_values($rowsByUrl);
-            $productCount = count($rows);
-
-            if ($rows !== []) {
-                P4cProduct::upsert($rows, ['product_url'], ['p4c_catagory_id', 'name', 'image', 'price', 'sku', 'updated_at']);
-            }
-
-            $endTime = now();
-            $startTime = $category->fresh()->process_start_date;
-            $syncMinutes = $startTime ? $startTime->diffInMinutes($endTime, true) : 0;
-
-            $category->update([
-                'is_sync' => 2,
-                'product_count' => $productCount,
-                'process_end_date' => $endTime,
-                'sync_minutes' => round($syncMinutes, 2),
-                'updated_at' => $endTime,
-            ]);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Products synced successfully for category: ' . $category->name,
-                'category' => $category->name,
-                'category_url' => $category->url,
-                'products_synced' => $productCount,
-            ]);
+            return response()->json($result, $result['status']);
         } catch (Throwable $exception) {
             if (isset($category) && $category !== null) {
-                $category->update([
-                    'is_sync' => 0,
-                    'process_start_date' => null,
-                    'updated_at' => now(),
-                ]);
+                $this->releaseP4cCategory($category);
             }
 
             return response()->json([
@@ -484,5 +358,170 @@ class Parts4CellsController extends Controller
                 'category' => $category?->name ?? 'Unknown',
             ], 500);
         }
+    }
+
+    private function releaseInterruptedP4cCategories(): int
+    {
+        return P4cCatagory::query()
+            ->where('is_sync', self::CATEGORY_STATUS_WORKING)
+            ->update([
+                'is_sync' => self::CATEGORY_STATUS_PENDING,
+                'process_start_date' => null,
+                'updated_at' => now(),
+            ]);
+    }
+
+    private function claimNextPendingP4cCategory(array $excludeIds = []): ?P4cCatagory
+    {
+        while (true) {
+            $query = P4cCatagory::query()
+                ->where('is_sync', self::CATEGORY_STATUS_PENDING)
+                ->whereNotNull('url')
+                ->where('url', '<>', '')
+                ->orderBy('id');
+
+            if ($excludeIds !== []) {
+                $query->whereNotIn('id', $excludeIds);
+            }
+
+            $candidate = $query->first();
+
+            if ($candidate === null) {
+                return null;
+            }
+
+            $updated = P4cCatagory::query()
+                ->where('id', $candidate->id)
+                ->where('is_sync', self::CATEGORY_STATUS_PENDING)
+                ->update([
+                    'is_sync' => self::CATEGORY_STATUS_WORKING,
+                    'process_start_date' => now(),
+                    'process_end_date' => null,
+                    'sync_minutes' => null,
+                    'updated_at' => now(),
+                ]);
+
+            if ($updated > 0) {
+                return $candidate->fresh();
+            }
+        }
+    }
+
+    private function handleP4cProductScraperResponse(P4cCatagory $category, mixed $nodeResponse): array
+    {
+        if ($nodeResponse instanceof Throwable || $nodeResponse === null) {
+            $this->releaseP4cCategory($category);
+
+            return [
+                'success' => false,
+                'message' => 'Product scraper request failed for category: ' . $category->name,
+                'category' => $category->name,
+                'category_url' => $category->url,
+                'status' => 500,
+                'body' => $nodeResponse instanceof Throwable ? $nodeResponse->getMessage() : null,
+            ];
+        }
+
+        if ($nodeResponse->failed()) {
+            $this->releaseP4cCategory($category);
+
+            return [
+                'success' => false,
+                'message' => 'Product scraper request failed for category: ' . $category->name,
+                'category' => $category->name,
+                'category_url' => $category->url,
+                'status' => $nodeResponse->status(),
+                'body' => $nodeResponse->body(),
+            ];
+        }
+
+        $payload = $nodeResponse->json();
+        $products = $payload['products'] ?? [];
+
+        if (!is_array($products)) {
+            $this->releaseP4cCategory($category);
+
+            return [
+                'success' => false,
+                'message' => 'Invalid product scraper response.',
+                'category' => $category->name,
+                'category_url' => $category->url,
+                'response' => $payload,
+                'status' => 422,
+            ];
+        }
+
+        $productCount = $this->upsertP4cProducts($category, $products);
+        $this->completeP4cCategory($category, $productCount);
+
+        return [
+            'success' => true,
+            'message' => 'Products synced successfully for category: ' . $category->name,
+            'category' => $category->name,
+            'category_url' => $category->url,
+            'products_synced' => $productCount,
+            'status' => 200,
+        ];
+    }
+
+    private function upsertP4cProducts(P4cCatagory $category, array $products): int
+    {
+        $now = now();
+        $rowsByUrl = [];
+
+        foreach ($products as $product) {
+            $name = trim((string) ($product['name'] ?? ''));
+            $productUrl = trim((string) ($product['product_url'] ?? ''));
+            $image = trim((string) ($product['image'] ?? ''));
+            $price = trim((string) ($product['price'] ?? ''));
+            $sku = trim((string) ($product['sku'] ?? ''));
+
+            if ($name === '' || $productUrl === '') {
+                continue;
+            }
+
+            $rowsByUrl[$productUrl] = [
+                'p4c_catagory_id' => $category->id,
+                'name' => $name,
+                'product_url' => $productUrl,
+                'image' => $image !== '' ? $image : null,
+                'price' => $price !== '' ? $price : null,
+                'sku' => $sku !== '' ? $sku : null,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        $rows = array_values($rowsByUrl);
+
+        if ($rows !== []) {
+            P4cProduct::upsert($rows, ['product_url'], ['p4c_catagory_id', 'name', 'image', 'price', 'sku', 'updated_at']);
+        }
+
+        return count($rows);
+    }
+
+    private function completeP4cCategory(P4cCatagory $category, int $productCount): void
+    {
+        $endTime = now();
+        $startTime = $category->fresh()->process_start_date;
+        $syncMinutes = $startTime ? $startTime->diffInMinutes($endTime, true) : 0;
+
+        $category->update([
+            'is_sync' => self::CATEGORY_STATUS_COMPLETED,
+            'product_count' => $productCount,
+            'process_end_date' => $endTime,
+            'sync_minutes' => round($syncMinutes, 2),
+            'updated_at' => $endTime,
+        ]);
+    }
+
+    private function releaseP4cCategory(P4cCatagory $category): void
+    {
+        $category->update([
+            'is_sync' => self::CATEGORY_STATUS_PENDING,
+            'process_start_date' => null,
+            'updated_at' => now(),
+        ]);
     }
 }
