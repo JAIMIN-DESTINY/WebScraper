@@ -16,7 +16,7 @@ class PhoneLCDPartsController extends Controller
 {
     private const CATEGORY_SCRAPER_URL = 'https://plp.asa2020.com/phonelcdparts/getCategory';
     private const PRODUCT_SCRAPER_URL = 'https://plp.asa2020.com/phonelcdparts/getProduct';
-    private const PRODUCT_SYNC_WORKERS = 5;
+    private const PRODUCT_SYNC_WORKERS = 1;
     private const CATEGORY_STATUS_PENDING = 0;
     private const CATEGORY_STATUS_WORKING = 1;
     private const CATEGORY_STATUS_COMPLETED = 2;
