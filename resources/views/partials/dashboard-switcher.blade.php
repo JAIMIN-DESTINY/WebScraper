@@ -3,6 +3,7 @@
         'ms' => ['label' => 'MS Dashboard', 'route' => 'ms-dashboard'],
         'p4c' => ['label' => 'P4C Dashboard', 'route' => 'p4c-dashboard'],
         'plp' => ['label' => 'PLP Dashboard', 'route' => 'plp-dashboard'],
+        'xcp' => ['label' => 'XCP Dashboard', 'route' => 'xcp-dashboard'],
     ];
 @endphp
 
